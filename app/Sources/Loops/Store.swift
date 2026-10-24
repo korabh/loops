@@ -577,7 +577,7 @@ final class Store {
 
   func notify(title: String, body: String, category: String? = nil, info: [String: Any] = [:]) {
     let shared = (Workspace.current?.projects.count ?? 1) > 1
-    notify(title: shared ? "\(name): \(title)" : title, body: body, category: category, info: info.merging(["project": id]) { a, _ in a })
+    Notify.post(title: shared ? "\(name): \(title)" : title, body: body, category: category, info: info.merging(["project": id]) { a, _ in a })
   }
 
   var appearanceBinding: Binding<Appearance> {
