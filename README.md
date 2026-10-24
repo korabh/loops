@@ -2,6 +2,11 @@
 
 Recurring Claude Code agents that keep a repo moving while you work on something else. Each loop does one job on a schedule: build the next ready issue into a pull request, review every new PR head, fix the review's findings and red checks on its own PRs, keep `main` green, pin merged changes with tests, flag drifting dependencies. A person still merges.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+  <img alt="Loops.app showing a project's Home: what needs you, the loops running now, and what runs next" src="docs/screenshot-light.png">
+</picture>
+
 Loops is two Claude Code plugins and a macOS menu bar app:
 
 - **`loops`**: the runner, its tick workflow, the review panel and eight general loops for any GitHub repo;
