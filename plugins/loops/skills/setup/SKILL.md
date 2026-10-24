@@ -23,7 +23,7 @@ Set this repo up for the loops plugin. Read `${CLAUDE_PLUGIN_ROOT}/skills/loops/
 
 4. **Ignore the runner's files**: add to `.gitignore` `.claude/worktrees/`, `.claude/loops/state/`, `.claude/loops/lessons/`, `.claude/loops/log.md`, `.claude/loops/notes.md`, `.claude/loops/answers.jsonl`, `.claude/loops/prod-events.jsonl` and `.claude/loops/watch.pid`.
 
-5. **Enable the plugins for everyone who opens the repo**: in `.claude/settings.json`, `extraKnownMarketplaces` gains `"loops": {"source": {"source": "github", "repo": "korabh/loops"}, "autoUpdate": true}` and `enabledPlugins` gains `"loops@loops": true` (and `"loops-convex@loops": true` with Convex).
+5. **Enable the plugins for everyone who opens the repo**: run `claude plugin install loops@loops --scope project` (and `loops-convex@loops` with Convex). It writes `extraKnownMarketplaces` and `enabledPlugins` into `.claude/settings.json` and installs the plugin for this Claude config folder. Everyone else who opens the repo, and every config folder the runner uses that does not share this one's plugins, runs the same install once; `loop-runner account add` links new folders to this one's plugins.
 
 6. **Check the skills the loops use.** The loops load `tdd`, `pr`, `blast-radius`, `code-review`, `review-spec`, `interrogate`, `implement-spec`, `correct` and `writing-for-agents` when the repo or the user has them, and read their files for panels. List the ones missing from `.claude/skills/` and `~/.claude/skills/`, and say where each comes from, as the plugin's README lists. A loop runs without them, with a thinner review.
 

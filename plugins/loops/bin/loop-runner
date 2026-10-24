@@ -333,6 +333,13 @@ start() {
   cfg '.setup.copy[]?' | while IFS= read -r f; do
     if [ -f "$main/$f" ] && [ ! -f "$runner/$f" ]; then mkdir -p "$(dirname "$runner/$f")" && cp "$main/$f" "$runner/$f"; fi
   done
+  if [ ! -f "$runner/.claude/loop.md" ]; then
+    have=$(cl plugin list --json 2>/dev/null) || have='[]'
+    for p in $(jq -r '[.loops[]?.plugin // empty] + ["loops"] | unique[]' "$conf" 2>/dev/null || echo loops); do
+      jq -e --arg id "$p@loops" 'any(.[]; .id == $id)' >/dev/null 2>&1 <<<"$have" ||
+        { echo "the $p plugin is not installed for $(email "$account"): from this repo, CLAUDE_CONFIG_DIR=$account claude plugin install $p@loops --scope project"; return 1; }
+    done
+  fi
   mkdir -p "$loops/state"
   prune
   jq -c '.setup.env[]?' "$conf" 2>/dev/null | while IFS= read -r g; do

@@ -40,6 +40,7 @@ case "$1 ${2:-}" in
   "agents "*) if [ -n "${NO_RUNNER:-}" ]; then echo '[]'; else printf '[{"name":"loop-runner","id":"abc12345","sessionId":"%s","state":"%s","status":"idle"%s}]\n' "${RUNNER_SESSION-s}" "${AGENT_STATE:-idle}" "${AGENT_CWD:+,\"cwd\":\"$AGENT_CWD\"}"; fi ;;
   "auth login") if [ -n "${LOGIN_AS:-}" ]; then jq --arg e "$LOGIN_AS" '.oauthAccount = {emailAddress: $e}' "$conf" >"$conf.tmp" && mv "$conf.tmp" "$conf"; fi ;;
   "auth logout") jq 'del(.oauthAccount)' "$conf" >"$conf.tmp" && mv "$conf.tmp" "$conf" ;;
+  "plugin list") if [ -n "${NO_PLUGINS:-}" ]; then echo '[]'; else echo '[{"id":"loops@loops"},{"id":"loops-convex@loops"}]'; fi ;;
 esac
 SH
 chmod +x "$WORK/bin/claude"
@@ -498,6 +499,18 @@ expect_eq "start copies the files the project lists into the runner checkout" "$
 expect_contains "start names unset variables and what goes without them" "$out" "unset: LOOPS_TEST_UNSET, so loop-a reads less."
 expect_missing "a group whose variables are all set says nothing" "$out" "never shown"
 expect_contains "start launches the runner" "$(cat "$CALLS")" "--bg --name loop-runner"
+
+fixture start-without-plugin
+printf '%s\n' '{"loops":[{"name":"loop-prod-errors","every":1,"plugin":"loops-convex"}]}' >"$runner/.claude/loops.json"
+out=$(NO_RUNNER=1 NO_PLUGINS=1 run start)
+expect_contains "start refuses an account without the loops plugins, naming the install" "$out" "the loops plugin is not installed for a@example.test"
+expect_missing "and starts no session" "$(cat "$CALLS")" "--bg"
+printf 'own prompt\n' >"$runner/.claude/loop.md"
+out=$(NO_RUNNER=1 NO_PLUGINS=1 run start)
+sleep 1
+pid=$(cat "$runner/.claude/loops/watch.pid" 2>/dev/null)
+[ -n "$pid" ] && kill "$pid" 2>/dev/null
+expect_contains "a repo with its own runner prompt starts without the plugin" "$(cat "$CALLS")" "--bg --name loop-runner"
 
 fixture config
 printf '%s\n' '{"timezone":"Pacific/Kiritimati","loops":[{"name":"loop-a","title":"A","every":1},{"name":"loop-b","title":"B","every":24,"hours":[0,6]}]}' >"$runner/.claude/loops.json"

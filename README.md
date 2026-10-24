@@ -36,13 +36,15 @@ More ready-made loops are in [`plugins/loops/gallery/`](plugins/loops/gallery/),
 
 ## Set up a repo
 
-1. Add the marketplace and the plugins, in Claude Code:
+1. Add the marketplace and install the plugins for the repo, from the repo:
 
+   ```bash
+   claude plugin marketplace add korabh/loops
+   claude plugin install loops@loops --scope project
+   claude plugin install loops-convex@loops --scope project   # with a Convex backend
    ```
-   /plugin marketplace add korabh/loops
-   /plugin install loops@loops
-   /plugin install loops-convex@loops
-   ```
+
+   Each Claude config folder needs the install once; accounts the runner adds with `loop-runner account add` share it.
 
 2. In the repo, run `/loops:setup`. It reads the repo and writes `.claude/loops.json` (install, gate, CI, schedule) and `.claude/loops/project.md` (what every loop should know), enables the plugins in `.claude/settings.json` for everyone who opens the repo, and opens a PR.
 
