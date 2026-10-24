@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo '{"cli":"prod-events runs inside the repo checkout"}'; exit 1; }
+cd "$root" || exit 1
+mkdir -p .claude/loops
+npx convex logs --prod --jsonl 2>&1 |
+  jq -R -c --unbuffered '(fromjson? // null) as $j | if $j != null then ($j | select(.kind == "Completion" and .error != null) | {ts: (.timestamp | floor | todate), fn: .identifier, type: .udfType, error: (.error | tostring | .[0:200])}) elif test("error|denied|unauthori|not logged in"; "i") then {cli: .[0:200]} else empty end' |
+  tee -a .claude/loops/prod-events.jsonl

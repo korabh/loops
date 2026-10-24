@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd -P)
+root=$(git -C "${LOOPS_REPO:-.}" rev-parse --show-toplevel 2>/dev/null) || { echo "run loop-gallery inside a git repo, or set LOOPS_REPO" >&2; exit 1; }
+gallery="$here/../gallery"
+conf=.claude/loops.json
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+meta() {
+  awk 'NR == 1 { if ($0 != "---") exit; next } /^---$/ { exit } { print }' "$1" |
+    jq -Rn '[inputs | capture("^(?<k>[A-Za-z_]+):[[:space:]]*(?<v>.*)$")? | {(.k): (.v as $v | try ($v | fromjson) catch $v)}] | add // {}'
+}
+
+steps() { awk 'NR == 1 && $0 == "---" { f = 1; next } f && /^---$/ { f = 0; body = 1; next } body { print }' "$1" | sed '/./,$!d'; }
+
+installed() {
+  { git -C "$root" show "origin/main:$conf" 2>/dev/null || cat "$root/$conf" 2>/dev/null; } | jq -r '.loops[]?.name' 2>/dev/null
+}
+
+list() {
+  names=$(installed | jq -Rs 'split("\n") | map(select(length > 0))')
+  for f in "$gallery"/*.md; do
+    [ -f "$f" ] || continue
+    meta "$f"
+  done | jq -s --argjson have "$names" 'map(. + {installed: (.name as $n | $have | index($n) != null)}) | sort_by(.group, .title)'
+}
+
+add() {
+  name=${1:?usage: bash $0 add <name>, with optional JSON overrides on stdin}
+  f="$gallery/$name.md"
+  [ -f "$f" ] || die "no gallery template named $name"
+  installed | grep -qxF "$name" && die "$name is already one of the loops"
+  overrides='{}'
+  if [ ! -t 0 ]; then
+    input=$(cat)
+    [ -n "$input" ] && overrides=$input
+  fi
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$overrides" || die "overrides on stdin are not a JSON object"
+  meta "$f" | jq --argjson o "$overrides" --arg steps "$(steps "$f")" '
+    {action: "add", name, title, group, every, hours: (.hours // null), alone: (.alone // false), model, worktree, description, ships}
+    + ($o | with_entries(select(.key | IN("title", "group", "every", "hours", "model", "worktree", "dry"))))
+    + {steps: $steps}
+    | with_entries(select(.value != null))' | (cd "$root" && bash "$here/loop-admin")
+}
+
+case "${1:-}" in
+  list) list ;;
+  add) add "${2:-}" ;;
+  *) echo "usage: bash $0 list | add <name>   (add reads optional JSON overrides on stdin: every, hours, model, worktree, title, group, dry)" >&2; exit 2 ;;
+esac

@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+common=$(git -C "${LOOPS_REPO:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { echo "run loop-admin inside a git repo, or set LOOPS_REPO" >&2; exit 1; }
+main=${common%/.git}
+conf=.claude/loops.json
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+say() { printf '%s\n' "$*" >&2; }
+
+input=$(cat)
+jq -e 'type == "object"' >/dev/null 2>&1 <<<"$input" || die "stdin is not a JSON object"
+
+get() { jq -r "$1 // empty" <<<"$input"; }
+
+has() { jq -e --arg k "$1" 'has($k)' >/dev/null <<<"$input"; }
+
+action=$(get .action)
+name=$(get .name)
+case "$action" in add | edit | remove) ;; *) die "action is add, edit or remove" ;; esac
+[[ "$name" =~ ^loop-[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "name is loop-<words>: lowercase letters, digits and dashes"
+
+err=$(jq -r '
+  def int: type == "number" and . == floor;
+  def line: type == "string" and test("^[^\n]+$");
+  [
+    (select(has("title")) | if (.title | type) == "string" and (.title | test("^[A-Za-z0-9][A-Za-z0-9 &+./-]*$")) then empty else "title is letters, digits, spaces and & + . / -" end),
+    (select(has("group") and .group != null) | if (.group | type) == "string" and (.group | test("^[A-Za-z0-9][A-Za-z0-9 &+./-]*$")) then empty else "group is letters, digits, spaces and & + . / -" end),
+    (select(has("every")) | if (.every | int) and .every >= 1 then empty else "every is a whole number of hours, 1 or more" end),
+    (select(has("hours") and .hours != null) | if (.hours | type) == "array" and (.hours | length) == 2 and all(.hours[]; int and . >= 0 and . <= 24) and .hours[0] != .hours[1] then empty else "hours is [start, end] in whole hours 0-24, start and end different" end),
+    (select(has("alone")) | if (.alone | type) == "boolean" then empty else "alone is true or false" end),
+    (select(has("worktree")) | if (.worktree | type) == "boolean" then empty else "worktree is true or false" end),
+    (select(has("model")) | if (.model | IN("fable", "opus", "sonnet", "haiku")) then empty else "model is fable, opus, sonnet or haiku" end),
+    (select(has("turns")) | if (.turns | int) and .turns >= 10 then empty else "turns is a whole number, 10 or more" end),
+    (select(has("description")) | if (.description | line) then empty else "description is one line" end),
+    (select(has("ships")) | if (.ships | line) and (.ships | test("[|]") | not) then empty else "ships is one line without |" end),
+    (select(has("steps")) | if (.steps | type) == "string" and (.steps | test("[^[:space:]]")) then empty else "steps is markdown text" end)
+  ] | first // empty' <<<"$input")
+[ -z "$err" ] || die "$err"
+
+if [ "$action" = add ]; then
+  for k in title every description ships steps; do has "$k" || die "add needs $k"; done
+fi
+
+prefix() {
+  case "$1" in
+    1) echo Hourly ;;
+    2) echo Two-hourly ;;
+    24) echo Daily ;;
+    168) echo Weekly ;;
+    *) echo "$1-hourly" ;;
+  esac
+}
+
+label() {
+  case "$1" in
+    24) c=daily ;;
+    168) c=weekly ;;
+    *) c="$1h" ;;
+  esac
+  if [ -n "$2" ]; then c="$c, $(jq -r '.[0], .[1]' <<<"$2" | xargs printf '%02d–%02d')"; fi
+  printf '%s' "$c"
+}
+
+rewrite() {
+  f=$1
+  shift
+  "$@" <"$f" >"$f.tmp" && mv "$f.tmp" "$f"
+}
+
+current() { jq -c --arg n "$name" 'first(.loops[] | select(.name == $n)) // empty' "$conf" 2>/dev/null; }
+
+tidy='. as $e | {name, title, group, every, hours, alone, ships} + ($e | del(.name, .title, .group, .every, .hours, .alone, .ships)) | with_entries(select(.value != null and .value != false))'
+
+loops() {
+  jq --indent 2 --arg n "$name" "$@" "$conf" |
+    perl -0pe 's/\[\n\s*((?:(?:"[^"\n]*"|-?\d+(?:\.\d+)?|true|false|null),\n\s*)*(?:"[^"\n]*"|-?\d+(?:\.\d+)?|true|false|null))\n\s*\]/my $x = $1; $x =~ s{,\n\s*}{, }g; "[$x]"/ge' >"$conf.tmp" && mv "$conf.tmp" "$conf"
+}
+
+describe() { jq -rn --arg d "$1 loop. $2" '$d | @json'; }
+
+git -C "$main" fetch -q origin || die "git fetch origin failed"
+stamp=$(date -u +%Y%m%d-%H%M%S)
+taken() { git -C "$main" rev-parse -q --verify "refs/heads/$1" >/dev/null || git -C "$main" ls-remote --exit-code --heads origin "$1" >/dev/null 2>&1; }
+branch="loops/$action-$name"
+n=1
+while taken "$branch"; do
+  branch="loops/$action-$name-$stamp${n#1}"
+  n=$((n + 1))
+done
+wt="$main/.claude/worktrees/$(printf '%s' "$branch" | tr / -)"
+git -C "$main" worktree add -q -b "$branch" "$wt" origin/main || die "could not add a worktree at $wt"
+dry=$(get '.dry')
+pushed=false
+cleanup() {
+  cd "$main" || return
+  git worktree remove --force "$wt" >/dev/null 2>&1
+  if [ "$pushed" = false ]; then git branch -q -D "$branch" >/dev/null 2>&1; fi
+}
+trap cleanup EXIT
+cd "$wt" || die "no worktree at $wt"
+
+skill=".claude/skills/$name/SKILL.md"
+agent=".claude/agents/$name.md"
+old=$(current)
+case "$action" in
+  add) [ -z "$old" ] && [ ! -e ".claude/skills/$name" ] || die "$name already exists" ;;
+  *) [ -n "$old" ] || die "no loop named $name in $conf on origin/main" ;;
+esac
+plugin=$(jq -r '.plugin // empty' <<<"${old:-null}" 2>/dev/null)
+if [ -n "$plugin" ] && [ "$action" = edit ]; then
+  for k in description model turns worktree steps; do has "$k" && die "$name comes from the $plugin plugin: only title, group, every, hours, alone and ships change here"; done
+fi
+
+case "$action" in
+  add)
+    new=$(jq -c "{name, title, group, every, hours, alone, ships} | $tidy" <<<"$input")
+    every=$(get .every)
+    before=$(jq -r --argjson n "$every" '[.loops[] | select(.every <= $n) | .name] | last // empty' "$conf")
+    loops --argjson new "$new" '.loops |= (([to_entries[] | select(.value.every <= $new.every) | .key] | last) as $i | if $i == null then [$new] + . else .[:$i + 1] + [$new] + .[$i + 1:] end)'
+    hours=$(jq -c '.hours // empty' <<<"$input")
+    mkdir -p ".claude/skills/$name"
+    {
+      printf -- '---\nname: %s\ndescription: %s\ndisable-model-invocation: true\n---\n\n' "$name" "$(describe "$(prefix "$every")" "$(get .description)")"
+      printf 'Read the loop conventions first, at the path your prompt names or `$(loop-runner kit)/conventions.md`; this loop runs on them.\n\n## Steps\n\n'
+      jq -r '.steps | sub("\\s+$"; "")' <<<"$input"
+    } >"$skill"
+    {
+      printf -- '---\nname: %s\ndescription: Loop worker, dispatched by the loop runner.\nmodel: %s\nmaxTurns: %s\n' "$name" "$(jq -r '.model // "opus"' <<<"$input")" "$(jq -r '.turns // 200' <<<"$input")"
+      if [ "$(jq -r 'if has("worktree") then .worktree else true end' <<<"$input")" = true ]; then printf 'isolation: worktree\n'; fi
+      printf 'disallowedTools: Artifact, EnterWorktree, mcp__*\n'
+      printf -- '---\n\nRead `.claude/skills/%s/SKILL.md` and follow it. Your prompt names the loop home and the loop conventions, and carries your state. Your result follows "Result" in the conventions.\n' "$name"
+    } >"$agent"
+    title="chore(loops): add $name, $(label "$every" "$hours")"
+    body="Adds \`$name\` ($(get .title)$([ -n "$(get .group)" ] && echo ", in $(get .group)")): $(label "$every" "$hours"), on $(jq -r '.model // "opus"' <<<"$input")$([ "$(jq -r 'if has("worktree") then .worktree else true end' <<<"$input")" = true ] && echo " in its own worktree")$([ "$(get .alone)" = true ] && echo ", alone after the other loops of its tick"). Ships: $(get .ships).
+
+The runner picks it up on its first tick after this merges."
+    ;;
+  edit)
+    new=$(jq -cn --argjson old "$old" --argjson patch "$input" "\$old + (\$patch | with_entries(select(.key | IN(\"title\", \"group\", \"every\", \"hours\", \"alone\", \"ships\")))) | $tidy")
+    was=$old
+    loops --argjson new "$new" '.loops |= map(if .name == $n then $new else . end)'
+    every=$(jq -r .every <<<"$new")
+    hours=$(jq -c '.hours // empty' <<<"$new")
+    desc=$(get .description)
+    if [ -n "$plugin" ]; then
+      :
+    elif [ -n "$desc" ]; then
+      d=$(describe "$(prefix "$every")" "$desc")
+      rewrite "$skill" awk -v d="description: $d" '!done && /^description:/ { print d; done = 1; next } { print }'
+    elif has every; then
+      rewrite "$skill" awk -v p="$(prefix "$every")" '!done && /^description:/ { sub(/[A-Za-z0-9-]+ loop[^.]*\./, p " loop."); done = 1 } { print }'
+    fi
+    model=$(get .model)
+    if [ -n "$model" ]; then rewrite "$agent" sed -E "s/^model: .*/model: $model/"; fi
+    turns=$(get .turns)
+    if [ -n "$turns" ]; then
+      rewrite "$agent" grep -v '^maxTurns:'
+      rewrite "$agent" awk -v t="maxTurns: $turns" '{ print } !done && /^model:/ { print t; done = 1 }'
+    fi
+    if has worktree; then
+      rewrite "$agent" grep -v '^isolation:'
+      if [ "$(get .worktree)" = true ]; then rewrite "$agent" awk '{ print } /^model:/ { print "isolation: worktree" }'; fi
+    fi
+    changed=$(jq -r 'del(.action, .name, .dry) | keys | join(", ")' <<<"$input")
+    title="chore(loops): $name changes $changed"
+    body="Changes \`$name\`: $changed.
+
+\`\`\`diff
+- $was
++ $(current)
+\`\`\`"
+    ;;
+  remove)
+    loops '.loops |= map(select(.name != $n))'
+    git rm -q -r ".claude/skills/$name" 2>/dev/null
+    git rm -q "$agent" 2>/dev/null
+    still=$(git grep -l -F -- "$name" 2>/dev/null | grep -v '^\.claude/loops/' | sed 's/^/- `/; s/$/`/')
+    title="chore(loops): remove $name"
+    body="Removes \`$name\`: its entry in the runner's cadences$([ -z "$plugin" ] && echo ", its skill and its agent"). Its state and lessons in the loop home stay."
+    if [ -n "$still" ]; then body="$body
+
+Still named in:
+$still"; fi
+    ;;
+esac
+
+git add -A
+if [ "$dry" = true ]; then
+  git diff --cached --stat
+  git diff --cached
+  exit 0
+fi
+git diff --cached --quiet && die "nothing changed: $name already reads that way"
+git commit -q -m "$title" || die "commit failed"
+say "committed on $branch"
+git push -q -u origin "$branch" || die "push of $branch failed"
+pushed=true
+url=$(gh pr create --base main --head "$branch" --title "$title" --body "$body") || die "gh pr create failed; $branch is pushed"
+printf '%s\n' "$url" | tail -n 1

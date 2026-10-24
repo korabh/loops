@@ -1,0 +1,10 @@
+{
+  "name": "loops-convex",
+  "description": "Loops for a Convex backend: function review, cost, and production errors. Needs the loops plugin.",
+  "author": { "name": "Korab Hoxha", "url": "https://github.com/korabh" },
+  "homepage": "https://github.com/korabh/loops",
+  "repository": "https://github.com/korabh/loops",
+  "license": "MIT",
+  "keywords": ["loops", "convex"],
+  "dependencies": ["loops"]
+}

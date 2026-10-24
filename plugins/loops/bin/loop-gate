@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+BASE="${1:?usage: loop-gate <base sha>}"
+export BASE
+cd "$(git rev-parse --show-toplevel)" || exit 1
+common=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1
+conf=.claude/loops.json
+suites="$common/loop-gate-suites"
+logs=$(mktemp -d)
+held=""
+trap '[ -n "$held" ] && rmdir "$suites" 2>/dev/null' EXIT
+failed=()
+
+steps=$(jq -c '.gate[]?' "$conf" 2>/dev/null)
+if [ -z "$steps" ]; then
+  echo "LOOP GATE: FAIL (no gate steps in $conf)"
+  exit 1
+fi
+
+one_at_a_time() {
+  until mkdir "$suites" 2>/dev/null; do
+    [ -n "$(find "$suites" -maxdepth 0 -mmin +30 2>/dev/null)" ] && rmdir "$suites" 2>/dev/null
+    sleep 5
+  done
+  held=1
+  "$@"
+  code=$?
+  rmdir "$suites"
+  held=""
+  return $code
+}
+
+step() {
+  name=$1
+  shift
+  start=$SECONDS
+  if "$@" >"$logs/$name.log" 2>&1; then
+    printf 'ok    %-20s %4ss\n' "$name" $((SECONDS - start))
+    grep -h '^FLAKY' "$logs/$name.log"
+  else
+    printf 'FAIL  %-20s %4ss  %s\n' "$name" $((SECONDS - start)) "$logs/$name.log"
+    failed+=("$name")
+  fi
+}
+
+while IFS= read -r s; do
+  name=$(jq -r '.name' <<<"$s")
+  run=$(jq -r '.run' <<<"$s")
+  if [ "$(jq -r '.alone // false' <<<"$s")" = true ]; then
+    step "$name" one_at_a_time bash -c "$run"
+  else
+    step "$name" bash -c "$run"
+  fi
+done <<<"$steps"
+
+for name in ${failed[@]+"${failed[@]}"}; do
+  echo
+  echo "== $name =="
+  hits=$(grep -E '^FAIL|error TS|FAIL +|✗|×|Error:|ERR!|failed' "$logs/$name.log" | grep -v '^ok ' | head -30)
+  if [ -n "$hits" ]; then printf '%s\n' "$hits"; else tail -n 20 "$logs/$name.log"; fi
+done
+
+echo
+if [ ${#failed[@]} -eq 0 ]; then echo "LOOP GATE: PASS"; exit 0; fi
+echo "LOOP GATE: FAIL (${failed[*]}); full logs in $logs"
+exit 1

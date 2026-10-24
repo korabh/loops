@@ -1,0 +1,17 @@
+{
+  "name": "loops",
+  "owner": { "name": "Korab Hoxha", "url": "https://github.com/korabh" },
+  "metadata": { "description": "Recurring Claude Code agents that keep a repo moving: issues to PRs, reviews, fixes, a green main, fewer stale branches." },
+  "plugins": [
+    {
+      "name": "loops",
+      "source": "./plugins/loops",
+      "description": "The loop runner, its tick workflow and nine general loops for any GitHub repo."
+    },
+    {
+      "name": "loops-convex",
+      "source": "./plugins/loops-convex",
+      "description": "Loops for a Convex backend: function review, cost, and production errors."
+    }
+  ]
+}

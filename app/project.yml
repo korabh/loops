@@ -1,0 +1,29 @@
+name: Loops
+options:
+  deploymentTarget:
+    macOS: "26.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+targets:
+  Loops:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Loops
+    settings:
+      base:
+        PRODUCT_NAME: Loops
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.korabh.loops
+        INFOPLIST_FILE: $(LOOPS_INFO_PLIST)
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+schemes:
+  Loops:
+    build:
+      targets:
+        Loops: all

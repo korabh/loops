@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd -P)
+home=${1:-$(bash "$here/loop-runner" home)}
+loops="$home/.claude/loops"
+since=$(jq -n 'now - 28 * 86400 | floor')
+
+present() { if [ -f "$1" ]; then printf '%s' "$1"; else printf /dev/null; fi; }
+
+asks() {
+  jq -Rn '
+    def marker: "(Needs a person|Decisions?(?: for a person)?):";
+    def cut: sub("^.*" + marker + "\\s*"; "");
+    def items:
+      sub("^\\s*-\\s+"; "")
+      | if test("claude-cli://") then
+          [match("(.*?)claude-cli://[^\\s<>]+"; "g") | .captures[0].string | cut | gsub("^[\\s;:,()-]+|[\\s;:,()-]+$"; "")]
+        elif test(marker) then
+          cut
+          | if test("^\\(1\\)") then [splits("\\s*\\(\\d{1,2}\\)\\s*")] | .[1:] else [.] end
+          | map(sub("[\\s;]+$"; ""))
+        else [] end
+      | map(select(length > 0));
+    reduce inputs as $l ({at: null, loop: null, out: []};
+      if ($l | test("^## \\d{4}-\\d{2}-\\d{2}T\\S+ \\S+")) then
+        ($l | capture("^## (?<at>\\S+) (?<loop>\\S+)")) as $h | .at = $h.at | .loop = $h.loop
+      elif .at != null then
+        .out += [($l | items)[] as $text | {at, loop, text: $text}]
+      else . end)
+    | .out' "$(present "$loops/log.md")"
+}
+
+notes() {
+  jq -Rn --argjson since "$since" '
+    [inputs | capture("^-\\s*(?<date>\\d{4}-\\d{2}-\\d{2})\\s+(?<loop>\\S+)\\s+(\\[(?<area>[^]]+)\\]\\s*)?(?<text>.+)$")?]
+    | map(select((.date + "T00:00:00Z" | fromdateiso8601) >= $since))
+    | unique
+    | group_by(.area // "other")
+    | map({area: (.[0].area // "other"), count: length, notes: map({date, loop, text})})
+    | sort_by(-.count, .area)' "$(present "$loops/notes.md")"
+}
+
+lessons() {
+  for f in "$loops"/lessons/*.md; do
+    [ -f "$f" ] || continue
+    jq -Rs --arg loop "$(basename "$f" .md)" 'split("\n") | map(select(test("\\S"))) | {loop: $loop, count: length, newest: .[-5:]}' "$f"
+  done | jq -s 'map(select(.count > 0))'
+}
+
+answers() {
+  jq -Rn '[inputs | fromjson? | select(type == "object" and (.at | type) == "string")]' "$(present "$loops/answers.jsonl")"
+}
+
+jq -n --arg home "$home" --argjson since "$since" --argjson asks "$(asks)" --argjson answers "$(answers)" --argjson notes "$(notes)" --argjson lessons "$(lessons)" '
+  def epoch: try (sub("\\.\\d+"; "") | fromdateiso8601) catch null;
+  def recent: map(select((.at | epoch) as $e | $e != null and $e >= $since));
+  ($asks | recent) as $asks
+  | ($answers | recent) as $answers
+  | ($asks + ($answers | map(select(.source != "brief"))) | map((now - (.at | epoch)) / 86400)) as $ages
+  | {
+      home: $home,
+      since: ($since | todate),
+      needed: {last7: ($ages | map(select(. >= 0 and . < 7)) | length), prior7: ($ages | map(select(. >= 7 and . < 14)) | length)},
+      asks: $asks,
+      notes: $notes,
+      lessons: $lessons,
+      answers: $answers
+    }'

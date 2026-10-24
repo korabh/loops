@@ -1,0 +1,140 @@
+{
+  "name": "Shop",
+  "about": "shop is a bun monorepo: a Convex backend (bun run test:convex) and a Next.js storefront in apps/web (bun run test).",
+  "timezone": "Europe/Paris",
+  "setup": {
+    "install": "bun install --frozen-lockfile",
+    "copy": [".env.local", "apps/web/.env.local"],
+    "env": [
+      {
+        "vars": ["SENTRY_AUTH_TOKEN", "SENTRY_ORG", "SENTRY_PROJECT"],
+        "without": "loop-prod-errors reads Convex only"
+      }
+    ]
+  },
+  "runner": {
+    "model": "sonnet",
+    "every": "1h"
+  },
+  "gate": [
+    {
+      "name": "typecheck",
+      "run": "bun run typecheck"
+    },
+    {
+      "name": "lint",
+      "run": "bun run lint"
+    },
+    {
+      "name": "test:convex",
+      "run": "bun run test:convex",
+      "alone": true
+    },
+    {
+      "name": "test",
+      "run": "bun run test",
+      "alone": true
+    }
+  ],
+  "ci": {
+    "workflow": "ci.yml"
+  },
+  "monitors": [
+    {
+      "description": "prod errors",
+      "command": "prod-events",
+      "wakes": "loop-prod-errors",
+      "hours": [8, 20],
+      "cooldown": 10
+    }
+  ],
+  "loops": [
+    {
+      "name": "loop-green-main",
+      "title": "Main keeper",
+      "group": "Guard",
+      "every": 24,
+      "plugin": "loops"
+    },
+    {
+      "name": "loop-prod-errors",
+      "title": "Error catcher",
+      "group": "Guard",
+      "every": 1,
+      "hours": [8, 20],
+      "plugin": "loops-convex"
+    },
+    {
+      "name": "loop-issue-queue",
+      "title": "Issue builder",
+      "group": "Ship",
+      "every": 1,
+      "plugin": "loops"
+    },
+    {
+      "name": "loop-pr-review",
+      "title": "PR reviewer",
+      "group": "Ship",
+      "every": 1,
+      "plugin": "loops"
+    },
+    {
+      "name": "loop-pr-fix",
+      "title": "PR fixer",
+      "group": "Ship",
+      "every": 1,
+      "idleFor": 24,
+      "plugin": "loops"
+    },
+    {
+      "name": "loop-convex-review",
+      "title": "Convex auditor",
+      "group": "Guard",
+      "every": 24,
+      "plugin": "loops-convex"
+    },
+    {
+      "name": "loop-tests",
+      "title": "Coverage hunter",
+      "group": "Guard",
+      "every": 24,
+      "plugin": "loops"
+    },
+    {
+      "name": "loop-dep-drift",
+      "title": "Dependency watcher",
+      "group": "Tidy",
+      "every": 168,
+      "plugin": "loops"
+    },
+    {
+      "name": "loop-convex-cost",
+      "title": "Cost tracker",
+      "group": "Watch",
+      "every": 168,
+      "plugin": "loops-convex"
+    },
+    {
+      "name": "loop-correct",
+      "title": "Habit breaker",
+      "group": "Tidy",
+      "every": 168,
+      "plugin": "loops"
+    },
+    {
+      "name": "loop-parked-branches",
+      "title": "Branch scout",
+      "group": "Watch",
+      "every": 168,
+      "plugin": "loops"
+    },
+    {
+      "name": "loop-release-notes",
+      "title": "Release notes",
+      "group": "Ship",
+      "every": 168,
+      "ships": "a weekly changelog PR",
+      "symbol": "doc.text"
+    }
+  ]
+}

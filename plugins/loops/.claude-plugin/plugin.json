@@ -1,0 +1,9 @@
+{
+  "name": "loops",
+  "description": "The loop runner, its tick workflow and nine general loops for any GitHub repo.",
+  "author": { "name": "Korab Hoxha", "url": "https://github.com/korabh" },
+  "homepage": "https://github.com/korabh/loops",
+  "repository": "https://github.com/korabh/loops",
+  "license": "MIT",
+  "keywords": ["loops", "automation", "pull-requests", "ci", "scheduling"]
+}

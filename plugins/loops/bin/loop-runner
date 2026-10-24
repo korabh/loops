@@ -1,0 +1,728 @@
+#!/usr/bin/env bash
+set -uo pipefail
+shopt -s nullglob
+
+here=$(cd "$(dirname "$0")/.." && pwd -P)
+common=$(git -C "${LOOPS_REPO:-.}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || { echo "run loop-runner inside a git repo, or set LOOPS_REPO" >&2; exit 1; }
+main=${common%/.git}
+runner="$main/.claude/worktrees/loop-runner"
+conf="$runner/.claude/loops.json"
+loops="$runner/.claude/loops"
+locks="$common/loop-locks"
+pidfile="$loops/watch.pid"
+log="$loops/log.md"
+stale=180
+active="$common/loop-account"
+pauses="$common/loop-paused"
+hooks="$common/loop-hooks.json"
+rest=60
+home="${LOOPS_HOME:-$HOME/.loops}"
+reg="$home/config.json"
+limits="$home/limited"
+
+on() {
+  d=$1
+  shift
+  if [ "$d" = "$HOME/.claude" ]; then env -u CLAUDE_CONFIG_DIR "$@"; else CLAUDE_CONFIG_DIR="$d" "$@"; fi
+}
+
+cl() { on "$account" claude "$@"; }
+
+config() { if [ "$1" = "$HOME/.claude" ]; then echo "$HOME/.claude.json"; else echo "$1/.claude.json"; fi; }
+
+email() { jq -r '.oauthAccount.emailAddress // empty' "$(config "$1")" 2>/dev/null; }
+
+ident() { jq -r '.oauthAccount // empty | "\(.accountUuid // .emailAddress)@\(.organizationUuid // "-")"' "$(config "$1")" 2>/dev/null; }
+
+edit() {
+  mkdir -p "$home"
+  until mkdir "$home/.lock" 2>/dev/null; do
+    [ -n "$(find "$home/.lock" -maxdepth 0 -mmin +1 2>/dev/null)" ] && rmdir "$home/.lock"
+    sleep 0.2
+  done
+  if [ -f "$reg" ]; then cur=$(cat "$reg"); else cur='{}'; fi
+  jq --arg p "$main" "$@" <<<"$cur" >"$reg.tmp" && mv "$reg.tmp" "$reg"
+  rmdir "$home/.lock"
+}
+
+register() {
+  jq -e --arg p "$main" '.projects[$p]' "$reg" >/dev/null 2>&1 && return
+  seed=$({ cat "$common/loop-accounts" 2>/dev/null; cat "$active" 2>/dev/null; } | awk 'NF && !seen[$0]++' | jq -R . | jq -cs .)
+  edit --argjson seed "$seed" '.shared = ((.shared // []) + ($seed - (.shared // []))) | .projects[$p] = {own: [], useShared: true}'
+  for d in $(jq -r '.[]' <<<"$seed"); do
+    old="$common/loop-limited/$(printf '%s' "$d" | tr / _)"
+    [ -f "$old" ] || continue
+    mkdir -p "$limits"
+    [ -f "$(key "$d")" ] || mv "$old" "$(key "$d")"
+  done
+}
+
+rotation() {
+  jq -r --arg p "$main" '(.projects[$p].own // [])[], (if .projects[$p].useShared == false then empty else (.shared // [])[] end)' "$reg" 2>/dev/null
+}
+
+known() { jq -r '(.shared // [])[], (.projects[]?.own // [])[]' "$reg" 2>/dev/null; }
+
+owner() { jq -r --arg d "$1" '[.projects | to_entries[] | select((.value.own // []) | index($d)) | .key][0] // empty' "$reg" 2>/dev/null; }
+
+load() {
+  account=$(cat "$active" 2>/dev/null)
+  [ -n "$account" ] || account=$(rotation | head -n 1)
+  account=${account:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}
+}
+
+abs() {
+  d=${1%/}
+  case "$d" in /*) ;; *) d="$PWD/$d" ;; esac
+  printf '%s' "$d"
+}
+
+session() {
+  cl agents --json 2>/dev/null | jq -c --arg r "$runner" '[.[] | select(.name == "loop-runner" and (.cwd // $r) == $r)][0] // empty'
+}
+
+sid() { session | jq -r '.id // (.sessionId // "" | .[0:8]) | select(. != "")'; }
+
+notify() {
+  osascript -e "display notification \"$1\" with title \"loop-runner · ${main##*/}\"" >/dev/null 2>&1 || printf '%s\n' "$1"
+}
+
+utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+cfg() { jq -r "$1 // empty" "$conf" 2>/dev/null; }
+
+hour() {
+  tz=$(cfg .timezone)
+  if [ -n "$tz" ]; then TZ=$tz date +%H; else date +%H; fi
+}
+
+busy() {
+  [ -d "$locks" ] || return 0
+  find "$locks" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -mmin -"$stale" -exec basename {} \;
+}
+
+paused() {
+  [ -d "$pauses" ] || return 0
+  find "$pauses" -mindepth 1 -maxdepth 1 -type f ! -name '.*' -exec basename {} \;
+}
+
+pause() {
+  [ $# -gt 0 ] || { paused; return; }
+  for l; do
+    case "$l" in loop-*) ;; *) l="loop-$l" ;; esac
+    jq -e --arg l "$l" '.loops[]? | select(.name == $l)' "$conf" >/dev/null 2>&1 || { echo "no loop named $l" >&2; return 1; }
+    mkdir -p "$pauses"
+    utc >"$pauses/$l"
+    echo "paused $l"
+  done
+}
+
+unpause() {
+  for l; do
+    case "$l" in loop-*) ;; *) l="loop-$l" ;; esac
+    rm -f "$pauses/$l"
+    echo "unpaused $l"
+  done
+}
+
+lock() {
+  name=${1:?usage: lock <loop>}
+  mkdir -p "$locks"
+  d="$locks/$name"
+  if ! mkdir "$d" 2>/dev/null; then
+    if [ -z "$(find "$d" -maxdepth 0 -mmin +"$stale")" ]; then
+      echo "$name is busy: a run started $(cat "$d/by" 2>/dev/null)"
+      return 1
+    fi
+    rm -rf "$d" && mkdir "$d" || return 1
+  fi
+  printf '%s in %s\n' "$(utc)" "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" >"$d/by"
+  echo "locked $name"
+}
+
+unlock() { rm -rf "$locks/${1:?usage: unlock <loop>}"; }
+
+skillsum() {
+  git -C "$runner" rev-parse "origin/main:.claude/skills/$1" 2>/dev/null && return
+  [ -d "$here/skills/$1" ] || return 1
+  cat "$here/skills/$1"/* "$here/conventions.md" 2>/dev/null | git hash-object --stdin
+}
+
+frontier() {
+  skillsum loop-issue-queue &&
+    (cd "$runner" && gh issue list --state open --label ready-for-agent --limit 200 --json number,updatedAt,assignees 2>/dev/null) |
+    jq -c --argjson now "$(date +%s)" 'map({number, updatedAt, assignees: ([.assignees[].login] | sort), stalled: ((.assignees | length) > 0 and $now - (.updatedAt | fromdateiso8601) >= 10800)}) | sort_by(.number)' &&
+    (cd "$runner" && gh issue list --state open --limit 500 --json number 2>/dev/null) | jq -c 'map(.number) | sort' &&
+    (cd "$runner" && gh pr list --state open --limit 200 --json number 2>/dev/null) | jq -c 'map(.number) | sort'
+}
+
+red='def red: ascii_upcase | IN("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE");'
+
+reds_on_main() {
+  sha=$(git -C "$runner" rev-parse origin/main 2>/dev/null) || return 1
+  runs=$(cd "$runner" && gh api "repos/{owner}/{repo}/commits/$sha/check-runs?per_page=100" 2>/dev/null) || return 1
+  statuses=$(cd "$runner" && gh api "repos/{owner}/{repo}/commits/$sha/status" 2>/dev/null) || return 1
+  jq -cn --argjson runs "$runs" --argjson statuses "$statuses" "$red"'
+    [($runs.check_runs | group_by(.name)[] | max_by(.completed_at // .started_at // "") | select(.conclusion // "" | red) | .name),
+     ($statuses.statuses[] | select(.state | red) | .context)] | unique'
+}
+
+fixable() {
+  main_reds=$(reds_on_main) || return 1
+  briefed=$(jq -c '.briefed // {}' "$loops/state/loop-pr-fix.json" 2>/dev/null) || briefed='{}'
+  prs=$(cd "$runner" && gh pr list --state open --limit 200 --json number,headRefName,headRefOid,statusCheckRollup,reviews 2>/dev/null) || return 1
+  jq -c --argjson main "$main_reds" --argjson briefed "$briefed" "$red"'
+    map(select(.headRefName | startswith("loop/")) | .headRefOid as $head | {
+      number,
+      head: $head,
+      reds: (if $briefed[.number | tostring] == $head then [] else
+        [.statusCheckRollup // [] | group_by(.name // .context)[] | max_by(.completedAt // .startedAt // "") | select(.conclusion // .state // "" | red) | .name // .context] - $main end),
+      review: ([(.reviews // [])[] | select(.commit.oid == $head and (.body // "" | test("\\A[^\\n]*(merge after act on|needs rework)"; "i"))) | .id] | last)
+    } | select((.reds | length) > 0 or .review != null)) | sort_by(.number)' <<<"$prs"
+}
+
+fingerprint() { git hash-object --stdin | cut -c1-12; }
+
+watched() {
+  w='{}'
+  if seen=$(frontier); then w=$(jq -c --arg v "$(printf '%s' "$seen" | fingerprint)" '. + {"loop-issue-queue": $v}' <<<"$w"); fi
+  if [ -n "$1" ] && skill=$(skillsum loop-pr-fix); then
+    w=$(jq -c --arg v "$(printf '%s\n%s' "$skill" "$1" | fingerprint)" '. + {"loop-pr-fix": $v}' <<<"$w")
+  fi
+  printf '%s\n' "$w"
+}
+
+reds() {
+  workflow=$(cfg .ci.workflow)
+  [ -n "$workflow" ] || return 0
+  (cd "$runner" && gh run list --workflow "$workflow" --status failure --limit 30 --json databaseId,headBranch 2>/dev/null) |
+    jq -c '.[] | {id: .databaseId, branch: .headBranch}' 2>/dev/null
+}
+
+ci_event() {
+  id=$(jq -r .id <<<"$1")
+  branch=$(jq -r .branch <<<"$1")
+  failed=$( (cd "$runner" && gh api "repos/{owner}/{repo}/actions/runs/$id/jobs?per_page=100" 2>/dev/null) |
+    jq -c --arg label "$(cfg .ci.label)" '[.jobs[]? | select($label == "" or ((.labels // []) | index($label))) | select((.steps // []) | length > 0) | select(.conclusion == "failure") | .name]' 2>/dev/null)
+  [ -n "$failed" ] && [ "$failed" != "[]" ] || return 0
+  case "$branch" in
+    main) jq -cn --argjson id "$id" --argjson failed "$failed" '{loop: "loop-green-main", run: $id, branch: "main", failed: $failed}' ;;
+    loop/*)
+      pr=$( (cd "$runner" && gh pr list --state open --limit 200 --json number,headRefName 2>/dev/null) |
+        jq -r --arg b "$branch" '[.[] | select(.headRefName == $b)][0].number // empty')
+      [ -z "$pr" ] || jq -cn --argjson id "$id" --arg b "$branch" --argjson pr "$pr" --argjson failed "$failed" \
+        '{loop: "loop-pr-fix", run: $id, branch: $b, pr: $pr, failed: $failed}'
+      ;;
+  esac
+}
+
+ci_events() {
+  seen="$common/loop-ci-seen"
+  while :; do
+    if [ -f "$seen" ]; then
+      reds | while IFS= read -r r; do
+        id=$(jq -r .id <<<"$r")
+        grep -qxF "$id" "$seen" && continue
+        printf '%s\n' "$id" >>"$seen"
+        ci_event "$r"
+      done
+    else
+      ids=$(reds | jq -r .id)
+      [ -z "$ids" ] || printf '%s\n' "$ids" >"$seen"
+    fi
+    [ "${1:-}" = --once ] && return
+    sleep "${CI_EVENTS_POLL:-90}"
+  done
+}
+
+unreviewed() {
+  reviewed=$(jq -c '.reviewed // {}' "$loops/state/loop-pr-review.json" 2>/dev/null) || reviewed='{}'
+  (cd "$runner" && gh pr list --state open --limit 200 --json number,headRefOid,isDraft,updatedAt 2>/dev/null) |
+    jq -c --argjson reviewed "$reviewed" --argjson now "$(date +%s)" '[.[] | select((.isDraft | not) and $now - (.updatedAt | fromdateiso8601) < 2592000 and $reviewed[.number | tostring] != .headRefOid) | .number]'
+}
+
+idle() {
+  {
+    if [ "$(unreviewed)" = "[]" ]; then echo loop-pr-review; fi
+    if [ "$1" = "[]" ]; then echo loop-pr-fix; fi
+  } | jq -R . | jq -cs .
+}
+
+inputs() {
+  states=$(for f in "$loops"/state/loop-*.json; do jq -c --arg k "$(basename "$f" .json)" '{($k): .}' "$f"; done | jq -cs 'add // {}')
+  fix=$(fixable) || fix=""
+  cadences=$(jq -c '.loops // []' "$conf" 2>/dev/null) || cadences='[]'
+  jq -cn --arg home "$runner" --arg kit "$here" --arg now "$(utc)" --arg hour "$(hour)" --argjson loops "${cadences:-[]}" \
+    --argjson states "$states" --argjson busy "$({ busy; paused; } | sort -u | jq -R . | jq -cs .)" --argjson watched "$(watched "$fix")" --argjson idle "$(idle "$fix")" \
+    '{home: $home, kit: $kit, now: $now, hour: $hour, loops: $loops, states: $states, busy: $busy, watched: $watched, idle: $idle}'
+}
+
+record() {
+  src=${1:--}
+  if [ "$src" = - ]; then input=$(cat); else input=$(cat "$src") || return 1; fi
+  rows=$(jq -c '(.result.ran // .ran // [.])[] | select(.loop)' <<<"$input") || return 1
+  [ -n "$rows" ] || { echo "no loop results in $src"; return 1; }
+  mkdir -p "$locks" "$loops/state" "$loops/lessons"
+  until mkdir "$locks/.record" 2>/dev/null; do
+    [ -n "$(find "$locks/.record" -maxdepth 0 -mmin +2 2>/dev/null)" ] && rmdir "$locks/.record"
+    sleep 1
+  done
+  while IFS= read -r row; do
+    l=$(jq -r .loop <<<"$row")
+    if [ "$(jq -r '.result | type' <<<"$row")" != object ]; then
+      f="$loops/state/$l.json"
+      if [ -f "$f" ]; then old=$(cat "$f"); else old='{}'; fi
+      n=$(jq -r '(.missed // 0) + 1' <<<"$old")
+      jq -c --argjson n "$n" --arg at "$(utc)" '. + {missed: $n, missedAt: $at}' <<<"$old" >"$f.tmp" && mv "$f.tmp" "$f"
+      unlock "$l"
+      echo "no result from $l, miss $n in a row: it stopped at its turn cap or failed, so it backs off before its next try"
+      continue
+    fi
+    if [ "$(jq -r '.result.busy // false' <<<"$row")" = true ]; then
+      echo "$l was busy, nothing recorded: $(jq -r .result.brief <<<"$row")"
+      continue
+    fi
+    at=$(cut -d' ' -f1 "$locks/$l/by" 2>/dev/null)
+    at=${at:-$(utc)}
+    f="$loops/state/$l.json"
+    new=$(jq -c --arg at "$at" '.result.state + {at: $at, missed: null, missedAt: null}' <<<"$row")
+    if [ -f "$f" ]; then old=$(cat "$f"); else old='{}'; fi
+    jq -c --argjson new "$new" '(. * $new) | walk(if type == "object" then with_entries(select(.value != null)) else . end)' <<<"$old" >"$f.tmp" && mv "$f.tmp" "$f"
+    { echo; echo "## $at $l"; jq -r .result.brief <<<"$row"; } >>"$log"
+    lesson=$(jq -r '.result.lesson // empty' <<<"$row")
+    [ -n "$lesson" ] && printf '%s\n' "$lesson" >>"$loops/lessons/$l.md"
+    jq -r '.result.note // empty' <<<"$row" | while IFS= read -r n; do
+      [ -n "$n" ] && printf -- '- %s %s %s\n' "${at:0:10}" "$l" "$n" >>"$loops/notes.md"
+    done
+    unlock "$l"
+    echo "recorded $l"
+  done <<<"$rows"
+  rmdir "$locks/.record"
+}
+
+prune() {
+  git -C "$main" fetch -q origin
+  git -C "$main" worktree prune
+  git -C "$main" worktree list --porcelain | sed -n 's/^worktree //p' | while IFS= read -r wt; do
+    case "$wt" in
+      "$runner") continue ;;
+      "$main"/.claude/worktrees/loop-* | "$main"/.claude/worktrees/agent-* | "$runner"/.claude/worktrees/*) ;;
+      *) continue ;;
+    esac
+    gd=$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null) || continue
+    [ -f "$gd/locked" ] && continue
+    [ -n "$(find "$gd/HEAD" "$gd/index" -mmin -720 2>/dev/null)" ] && continue
+    [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ] || continue
+    git -C "$wt" merge-base --is-ancestor HEAD origin/main 2>/dev/null || continue
+    git -C "$main" worktree remove "$wt" && echo "removed $wt: clean, merged, untouched for 12 hours"
+  done
+}
+
+start() {
+  if [ -n "$(session)" ]; then
+    echo "loop-runner is already running: bash $0 status"
+    return 0
+  fi
+  if [ ! -d "$runner" ]; then
+    git -C "$main" fetch -q origin && git -C "$main" worktree add -q --detach "$runner" origin/main || return 1
+  fi
+  git -C "$runner" fetch -q origin
+  if [ -z "$(git -C "$runner" status --porcelain --untracked-files=no)" ]; then git -C "$runner" switch -q --detach origin/main; fi
+  install=$(cfg .setup.install)
+  if [ -n "$install" ]; then (cd "$runner" && bash -c "$install" >/dev/null) || return 1; fi
+  cfg '.setup.copy[]?' | while IFS= read -r f; do
+    if [ -f "$main/$f" ] && [ ! -f "$runner/$f" ]; then mkdir -p "$(dirname "$runner/$f")" && cp "$main/$f" "$runner/$f"; fi
+  done
+  mkdir -p "$loops/state"
+  prune
+  jq -c '.setup.env[]?' "$conf" 2>/dev/null | while IFS= read -r g; do
+    unset_vars=""
+    for v in $(jq -r '.vars[]' <<<"$g"); do [ -n "${!v:-}" ] || unset_vars="$unset_vars $v"; done
+    [ -z "$unset_vars" ] || echo "unset:$unset_vars, so $(jq -r .without <<<"$g")."
+  done
+  launch || return 1
+  nohup bash "$0" watch >/dev/null 2>&1 &
+}
+
+spawn() {
+  if [ -f "$hooks" ]; then set -- --settings "$hooks" "$@"; fi
+  model=$(cfg .runner.model)
+  every=$(cfg .runner.every)
+  if [ -f "$runner/.claude/loop.md" ]; then tick="/loop ${every:-1h}"; else tick="/loop ${every:-1h} /loops:runner"; fi
+  (cd "$runner" && cl --bg --name loop-runner --model "${model:-sonnet}" --permission-mode auto "$@" "$tick")
+}
+
+launch() { spawn --remote-control loop-runner || { [ -n "$(session)" ] || spawn; }; }
+
+stop() {
+  running=$(busy | tr '\n' ' ')
+  if [ -n "$running" ] && [ "${1:-}" != --force ]; then
+    echo "loops still running: ${running% }. Wait for their briefs, or bash $0 stop --force; a killed loop's lock clears after $((stale / 60)) hours, or with bash $0 unlock <loop>."
+    return 1
+  fi
+  id=$(sid)
+  [ -n "$id" ] && cl stop "$id"
+  if [ -f "$pidfile" ]; then
+    kill "$(cat "$pidfile")" 2>/dev/null
+    rm -f "$pidfile"
+  fi
+}
+
+status() {
+  echo "account: $(email "$account") ($account)"
+  s=$(session)
+  if [ -n "$s" ]; then printf '%s\n' "$s" | jq '{name, id, state, status, waitingFor}'; else echo "loop-runner is not running"; fi
+  running=$(busy | tr '\n' ' ')
+  [ -n "$running" ] && echo "running: $running"
+  held=$(paused | tr '\n' ' ')
+  [ -n "$held" ] && echo "paused: $held"
+  [ -f "$log" ] && tail -n 12 "$log"
+}
+
+limit() {
+  j="$account/jobs/$(printf '%s' "${1:-}" | jq -r '.id // empty' 2>/dev/null)/state.json"
+  [ -f "$j" ] && jq -r -e 'select(.state == "blocked") | .detail // empty | select(test("(hit your|usage) [a-z -]*limit"; "i"))' "$j" 2>/dev/null && return
+  d=$(printf '%s' "$runner" | sed 's/[^A-Za-z0-9-]/-/g')
+  f="$account/projects/$d/$(printf '%s' "${1:-}" | jq -r '.sessionId // empty' 2>/dev/null).jsonl"
+  [ -f "$f" ] || f=$(ls -t "$account/projects/$d"/*.jsonl 2>/dev/null | head -1)
+  [ -n "$f" ] && tail -n 50 "$f" | jq -R -s -r -e '[split("\n")[] | fromjson? | select(.type == "assistant" or .type == "user")] | last | select(.isApiErrorMessage == true and .error == "rate_limit") | .message.content[0].text // "usage limit"'
+}
+
+key() {
+  i=$(ident "$1")
+  printf '%s/%s' "$limits" "$(printf '%s' "${i:-$1}" | tr / _)"
+}
+
+limited_at() { head -n 1 "$(key "$1")" 2>/dev/null; }
+
+resets() { sed -n 2p "$(key "$1")" 2>/dev/null; }
+
+rested() {
+  t=$(limited_at "$1")
+  [ -z "$t" ] || [ $(($(date +%s) - t)) -ge $((rest * 60)) ]
+}
+
+listed() { { rotation; printf '%s\n' "$account"; } | awk 'NF && !seen[$0]++'; }
+
+next_account() {
+  {
+    jq -r --arg p "$main" '(.projects[$p].own // [])[]' "$reg" 2>/dev/null
+    listed | awk -v c="$account" '$0 == c {f = 1; next} f {print; next} {b[++n] = $0} END {for (i = 1; i <= n; i++) print b[i]}'
+  } | awk -v c="$account" '$0 != c && !seen[$0]++' |
+    while IFS= read -r d; do
+      if rested "$d" && [ -n "$(email "$d")" ]; then
+        printf '%s\n' "$d"
+        break
+      fi
+    done
+}
+
+release() {
+  for d in "$locks"/*/; do
+    by=$(cat "$d/by" 2>/dev/null)
+    case "${by#* in }" in
+      "$runner" | "$runner"/* | "$main"/.claude/worktrees/wf_*) rm -rf "${d%/}" && echo "released $(basename "$d")" ;;
+    esac
+  done
+}
+
+switch() {
+  id=$(sid)
+  [ -n "$id" ] && cl stop "$id" >/dev/null
+  release
+  printf '%s\n' "$1" >"$active"
+  account=$1
+  launch
+}
+
+resume() {
+  s=$(session)
+  [ -n "$s" ] || { echo "loop-runner is not running: bash $0 start"; return 1; }
+  st=$(printf '%s' "$s" | jq -r '.state // "unknown"')
+  case "$st" in
+    blocked | failed | stopped | done) ;;
+    *)
+      if [ "${1:-}" != --force ]; then
+        echo "loop-runner is $st; resume restarts a runner that is blocked or stopped (bash $0 resume --force restarts it anyway)"
+        return 1
+      fi
+      ;;
+  esac
+  switch "$account" || return 1
+  if ! watching; then nohup bash "$0" watch >/dev/null 2>&1 & fi
+  echo "loop-runner restarted on $(email "$account"); its first tick starts now"
+}
+
+watching() { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
+
+use() {
+  to=${1:?usage: account use <config dir>|next [--force]}
+  if [ "$to" = next ]; then
+    to=$(next_account)
+    [ -n "$to" ] || { echo "no other account is signed in and past its usage limit: bash $0 account"; return 1; }
+  fi
+  to=$(abs "$to")
+  [ -n "$(email "$to")" ] || { echo "$to is not signed in: bash $0 account add $to"; return 1; }
+  [ "$to" = "$account" ] && { echo "loop-runner is already on $(email "$to")"; return 0; }
+  if [ -z "$(session)" ]; then
+    printf '%s\n' "$to" >"$active"
+    echo "loop-runner starts on $(email "$to") next time: bash $0 start"
+    return 0
+  fi
+  running=$(busy | tr '\n' ' ')
+  if [ -n "$running" ] && [ "${2:-}" != --force ]; then
+    echo "loops still running: ${running% }. Moving stops them; wait for their briefs, or bash $0 account use $to --force."
+    return 1
+  fi
+  switch "$to" || return 1
+  if ! watching; then nohup bash "$0" watch >/dev/null 2>&1 & fi
+  echo "loop-runner is on $(email "$to")"
+}
+
+made_dir() {
+  while :; do
+    d="$HOME/.claude-loops-$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'a-z0-9' 2>/dev/null | head -c 6)"
+    if [ ! -e "$d" ]; then
+      printf '%s' "$d"
+      return
+    fi
+  done
+}
+
+add() {
+  made=""
+  dir=""
+  scope=shared
+  for a; do
+    case "$a" in
+      --own) scope=own ;;
+      "") ;;
+      *) dir=$(abs "$a") ;;
+    esac
+  done
+  if [ -z "$dir" ]; then
+    dir=$(made_dir)
+    made=yes
+  fi
+  if [ ! -e "$dir" ]; then
+    mkdir -p "$dir"
+    for f in settings.json CLAUDE.md skills agents commands plugins; do
+      if [ -e "$account/$f" ]; then ln -s "$account/$f" "$dir/$f"; fi
+    done
+    paths=$(jq -c '[.projects | keys[] | ., . + "/.claude/worktrees/loop-runner"]' "$reg" 2>/dev/null) || paths='[]'
+    jq --argjson paths "${paths:-[]}" '{hasCompletedOnboarding, hasSeenAutoModeEntryWarning, hasSeenAutoDefaultNotice, hasSeenAutoModeOutsideReadPrompt, mcpServers, projects: ((.projects // {}) as $have | reduce $paths[] as $q ({}; .[$q] = {hasTrustDialogAccepted: ($have[$q].hasTrustDialogAccepted // false)}))} | with_entries(select(.value != null))' "$(config "$account")" >"$(config "$dir")"
+  fi
+  if [ "$scope" = own ]; then
+    edit --arg d "$dir" '.shared = ((.shared // []) - [$d]) | .projects[$p].own = (((.projects[$p].own // []) - [$d]) + [$d])'
+  elif [ -z "$(owner "$dir")" ]; then
+    edit --arg d "$dir" '.shared = (((.shared // []) - [$d]) + [$d])'
+  fi
+  fresh=""
+  if [ -z "$(email "$dir")" ]; then
+    on "$dir" claude auth login
+    fresh=yes
+  fi
+  e=$(email "$dir")
+  if [ -z "$e" ]; then
+    if [ -n "$made" ]; then
+      discard
+      echo "the sign-in did not finish, so nothing was added: bash $0 account add"
+    else
+      echo "$dir is not signed in yet: bash $0 account add $dir"
+    fi
+    return 1
+  fi
+  twin=$(twin "$dir" "$(ident "$dir")")
+  if [ -n "$twin" ]; then
+    drop "$dir"
+    if [ -n "$fresh" ]; then on "$dir" claude auth logout >/dev/null 2>&1; fi
+    if [ -n "$made" ]; then
+      discard
+      echo "that sign-in was $e, which $twin already is, so nothing was added. Run bash $0 account add again and pick the other account in the browser."
+    elif [ -n "$fresh" ]; then
+      echo "that sign-in was $e, which $twin already is, so it is signed out again. Run bash $0 account add $dir and pick the other account in the browser."
+    else
+      echo "$dir is signed in as $e, which $twin already is, so it stays out of the rotation"
+    fi
+    return 1
+  fi
+  if [ "$scope" = own ]; then
+    echo "$e ($dir) is this project's own account; loop-runner moves to it first when $(email "$account") hits its usage limit"
+  else
+    echo "$e ($dir) is shared: loop-runner moves to it when $(email "$account") hits its usage limit, and so can any project that uses shared accounts"
+  fi
+}
+
+discard() {
+  drop "$dir"
+  rm -rf "$dir"
+}
+
+twin() {
+  { known; printf '%s\n' "$account"; } | awk 'NF && !seen[$0]++' | grep -vxF "$1" | while IFS= read -r d; do
+    if [ -n "$2" ] && [ "$(ident "$d")" = "$2" ]; then
+      printf '%s\n' "$d"
+      break
+    fi
+  done
+}
+
+drop() { edit --arg d "$1" '.shared = ((.shared // []) - [$d]) | .projects[$p].own = ((.projects[$p].own // []) - [$d])'; }
+
+holder() {
+  jq -r '.projects | keys[]' "$reg" 2>/dev/null | while IFS= read -r q; do
+    if [ "$(cat "$q/.git/loop-account" 2>/dev/null)" = "$1" ]; then
+      printf '%s\n' "$q"
+      break
+    fi
+  done
+}
+
+remove() {
+  dir=$(abs "${1:?usage: account remove <config dir> [--sign-out]}")
+  rotation | grep -qxF "$dir" || { echo "$dir is not in this project's rotation: bash $0 account"; return 1; }
+  [ "$dir" = "$account" ] && { echo "loop-runner is on $(email "$dir"); move it first: bash $0 account use <config dir>"; return 1; }
+  q=$(holder "$dir")
+  if [ -n "$q" ] && [ -z "$(owner "$dir")" ]; then
+    echo "the loop-runner of $q is on $(email "$dir"); move it there first, or keep it shared"
+    return 1
+  fi
+  e=$(email "$dir")
+  drop "$dir"
+  if [ "${2:-}" = --sign-out ]; then
+    on "$dir" claude auth logout >/dev/null 2>&1 || { echo "removed $dir from the rotation; signing it out failed"; return 1; }
+    echo "removed ${e:-$dir} ($dir) from the rotation and signed it out"
+  else
+    echo "removed ${e:-$dir} ($dir) from the rotation; its folder stays signed in"
+  fi
+}
+
+own() {
+  dir=$(abs "${1:?usage: account own <config dir>}")
+  known | grep -qxF "$dir" || { echo "$dir is not a loops account: bash $0 account add $dir --own"; return 1; }
+  q=$(owner "$dir")
+  [ -z "$q" ] || [ "$q" = "$main" ] || { echo "$dir is the own account of $q"; return 1; }
+  edit --arg d "$dir" '.shared = ((.shared // []) - [$d]) | .projects[$p].own = (((.projects[$p].own // []) - [$d]) + [$d])'
+  echo "$(email "$dir") ($dir) is this project's own account now; other projects stop using it"
+}
+
+share() {
+  dir=$(abs "${1:?usage: account share <config dir>}")
+  [ "$(owner "$dir")" = "$main" ] || { echo "$dir is not this project's own account"; return 1; }
+  edit --arg d "$dir" '.projects[$p].own = ((.projects[$p].own // []) - [$d]) | .shared = (((.shared // []) - [$d]) + [$d])'
+  echo "$(email "$dir") ($dir) is shared now"
+}
+
+uses() {
+  case "${1:-}" in
+    on) edit '.projects[$p].useShared = true' && echo "this project uses shared accounts after its own" ;;
+    off) edit '.projects[$p].useShared = false' && echo "this project uses only its own accounts" ;;
+    *) echo "usage: bash $0 account shared on|off" >&2; return 2 ;;
+  esac
+}
+
+list() {
+  listed | while IFS= read -r d; do
+    if [ "$d" = "$account" ]; then m="*"; else m=" "; fi
+    if [ "$(owner "$d")" = "$main" ]; then w=own; else w=shared; fi
+    e=$(email "$d")
+    t=$(limited_at "$d")
+    printf '%s %s  %s  %s%s\n' "$m" "${e:-not signed in}" "$d" "$w" "${t:+  $(resets "$d"), seen $(date -r "$t" +%H:%M)}"
+  done
+}
+
+account_cmd() {
+  case "${1:-}" in
+    "") list ;;
+    add) add "${2:-}" "${3:-}" ;;
+    use) use "${2:-}" "${3:-}" ;;
+    remove) remove "${2:-}" "${3:-}" ;;
+    own) own "${2:-}" ;;
+    share) share "${2:-}" ;;
+    shared) uses "${2:-}" ;;
+    *) echo "usage: bash $0 account [add [<config dir>] [--own]|use <config dir>|next [--force]|remove <config dir> [--sign-out]|own <config dir>|share <config dir>|shared on|off]" >&2; return 2 ;;
+  esac
+}
+
+state() {
+  s=$(session)
+  w=false
+  watching && w=true
+  l=false
+  limit "$s" >/dev/null && l=true
+  listed | while IFS= read -r d; do
+    jq -cn --arg dir "$d" --arg email "$(email "$d")" --arg at "$(limited_at "$d")" --arg resets "$(resets "$d")" --argjson own "$([ "$(owner "$d")" = "$main" ] && echo true || echo false)" \
+      '{dir: $dir, email: (if $email == "" then null else $email end), limitedAt: (if $at == "" then null else ($at | tonumber) end), limit: (if $resets == "" then null else $resets end), own: $own}'
+  done | jq -cs --arg account "$account" --arg project "$main" --argjson shared "$(jq -c --arg p "$main" '.projects[$p].useShared != false' "$reg" 2>/dev/null || echo true)" \
+    --argjson session "${s:-null}" --argjson limited "$l" --argjson watching "$w" \
+    --argjson busy "$(busy | jq -R . | jq -cs .)" --argjson paused "$(paused | jq -R . | jq -cs .)" \
+    '{project: $project, account: $account, accounts: ., useShared: $shared, session: $session, limited: $limited, watching: $watching, busy: $busy, paused: $paused}'
+}
+
+check() {
+  load
+  s=$(session)
+  if [ -z "$s" ]; then
+    echo "not running"
+    return
+  fi
+  if msg=$(limit "$s"); then
+    mkdir -p "$limits"
+    printf '%s\n%s\n%s\n' "$(date +%s)" "$msg" "$main" >"$(key "$account")"
+    from=$(email "$account")
+    to=$(next_account)
+    if [ -z "$to" ]; then
+      echo "at its usage limit on every account"
+    elif switch "$to" >/dev/null; then
+      echo "on $(email "$to") now: $from hit its usage limit"
+    else
+      echo "at its usage limit on $from, and starting on $(email "$to") failed"
+    fi
+    return
+  fi
+  m=$(key "$account")
+  if [ "$(sed -n 3p "$m" 2>/dev/null)" = "$main" ] || rested "$account"; then rm -f "$m"; fi
+  now=$(printf '%s' "$s" | jq -r 'if .waitingFor then "blocked on \(.waitingFor)" elif .state == "blocked" or .state == "failed" then .state else "ok" end')
+  if [ "$now" = "ok" ] && [ -z "$(find "$log" -mmin -150 2>/dev/null)" ]; then now="silent: no brief in 2.5 hours"; fi
+  echo "$now"
+}
+
+watch() {
+  echo $$ >"$pidfile"
+  warned=""
+  while :; do
+    now=$(check)
+    if [ "$now" != "ok" ] && [ "$now" != "$warned" ]; then notify "loop-runner is $now. bash $0 status"; fi
+    if [ "$now" = "ok" ]; then warned=""; else warned="$now"; fi
+    if [ -z "$(busy)" ] && [ -z "$(git -C "$runner" status --porcelain --untracked-files=no)" ]; then
+      git -C "$runner" fetch -q origin && git -C "$runner" switch -q --detach origin/main
+    fi
+    sleep 300
+  done
+}
+
+register
+load
+
+case "${1:-status}" in
+  start) start ;;
+  stop) stop "${2:-}" ;;
+  status) status ;;
+  state) state ;;
+  check) check ;;
+  watch) watch ;;
+  resume) resume "${2:-}" ;;
+  account) account_cmd "${2:-}" "${3:-}" "${4:-}" ;;
+  attach) id=$(sid) && [ -n "$id" ] && cd "$runner" && cl attach "$id" ;;
+  home) echo "$runner" ;;
+  kit) echo "$here" ;;
+  inputs) inputs ;;
+  lock) lock "${2:-}" ;;
+  unlock) unlock "${2:-}" ;;
+  record) record "${2:--}" ;;
+  prune) prune ;;
+  pause) shift; pause "$@" ;;
+  unpause) shift; unpause "$@" ;;
+  ci-events) ci_events "${2:-}" ;;
+  *) echo "usage: bash $0 start|stop [--force]|resume [--force]|status|state|check|account [add [<dir>] [--own]|use <dir>|next [--force]|remove <dir> [--sign-out]|own <dir>|share <dir>|shared on|off]|attach|home|kit|inputs|lock <loop>|unlock <loop>|record [file]|prune|pause [<loop>...]|unpause <loop>...|ci-events [--once]" >&2; exit 2 ;;
+esac
