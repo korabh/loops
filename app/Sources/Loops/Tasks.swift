@@ -61,14 +61,14 @@ extension Store {
   }
 
   func loadTasks() {
-    guard let data = UserDefaults.standard.data(forKey: "tasks"),
+    guard let data = defaults.data(forKey: "tasks"),
       let saved = try? JSONDecoder().decode([BgTask].self, from: data)
     else { return }
     tasks = saved
   }
 
   func saveTasks() {
-    if let data = try? JSONEncoder().encode(tasks) { UserDefaults.standard.set(data, forKey: "tasks") }
+    if let data = try? JSONEncoder().encode(tasks) { defaults.set(data, forKey: "tasks") }
   }
 
   static func prompt(from url: URL?) -> String? {
@@ -153,7 +153,7 @@ extension Store {
           : t.label == "Limit hit"
             ? (t.limit?.resets.map { "It picks up on its own at \(Clock.day($0, now: Date()))." } ?? "Open Loops to resume it.")
             : ((t.goal?.reason ?? t.answer).map { String($0.prefix(160)) } ?? "Open Loops for its answer.")
-        Notify.post(
+        notify(
           title: "\(t.title): \(t.label.lowercased())", body: body, category: t.label == "Needs you" ? Notify.answer : nil,
           info: ["task": t.stable])
       }

@@ -75,8 +75,6 @@ enum RecallScope: String, CaseIterable, Identifiable {
 
 @MainActor @Observable
 final class Recall {
-  static let shared = Recall()
-
   private(set) var brief: RecallBrief?
   private(set) var started: Date?
   var failure: String?
@@ -88,8 +86,11 @@ final class Recall {
   private static let schema =
     #"{"type":"object","additionalProperties":false,"required":["capsule","threads","problems","next"],"properties":{"capsule":{"type":"array","maxItems":5,"items":{"type":"string"}},"threads":{"type":"array","maxItems":20,"items":{"type":"object","additionalProperties":false,"required":["status","title"],"properties":{"status":{"type":"string","enum":["merged","open","inflight","verified","reverted","planned"]},"title":{"type":"string"},"pr":{"type":"integer"},"branch":{"type":"string"}}}},"problems":{"type":"array","maxItems":5,"items":{"type":"object","additionalProperties":false,"required":["text"],"properties":{"text":{"type":"string"},"pr":{"type":"integer"}}}},"next":{"type":"object","additionalProperties":false,"required":["text"],"properties":{"text":{"type":"string"},"pr":{"type":"integer"},"prompt":{"type":"string"}}}}}"#
 
-  init() {
-    if let data = UserDefaults.standard.data(forKey: "recall"), let saved = try? JSONDecoder().decode(RecallBrief.self, from: data) {
+  @ObservationIgnored private let defaults: UserDefaults
+
+  init(defaults: UserDefaults) {
+    self.defaults = defaults
+    if let data = defaults.data(forKey: "recall"), let saved = try? JSONDecoder().decode(RecallBrief.self, from: data) {
       brief = saved
     }
   }
@@ -126,7 +127,7 @@ final class Recall {
       b.hours = hours
       b.topic = topic.isEmpty ? nil : topic
       brief = b
-      if let data = try? JSONEncoder().encode(b) { UserDefaults.standard.set(data, forKey: "recall") }
+      if let data = try? JSONEncoder().encode(b) { defaults.set(data, forKey: "recall") }
     }
   }
 

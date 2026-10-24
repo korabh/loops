@@ -9,6 +9,7 @@ struct LoopsWindow: View {
     @Bindable var store = store
     NavigationSplitView {
       Sidebar(query: query)
+        .safeAreaBar(edge: .top) { ProjectPicker() }
         .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
         .searchable(text: $query, placement: .sidebar, prompt: "Search")
     } detail: {
@@ -130,7 +131,7 @@ struct Sidebar: View {
             HStack {
               Text(page.title)
               Spacer(minLength: 4)
-              if page == .plan, Planner.shared.busy != nil || Directions.shared.busy { WorkingIcon(symbol: "asterisk", size: 12) }
+              if page == .plan, store.planner.busy != nil || store.directions.busy { WorkingIcon(symbol: "asterisk", size: 12) }
             }
           } icon: {
             Image(icon: page.symbol)

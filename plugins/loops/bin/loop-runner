@@ -88,6 +88,14 @@ env_cmd() {
   done
 }
 
+forget() {
+  if [ -n "$(session)" ]; then
+    echo "loop-runner is running for this repo; stop it first: $0 stop"
+    return 1
+  fi
+  edit 'del(.projects[$p])' && echo "forgot $main; its files and loops stay as they are"
+}
+
 load() {
   account=$(cat "$active" 2>/dev/null)
   [ -n "$account" ] || account=$(rotation | head -n 1)
@@ -747,6 +755,7 @@ case "${1:-status}" in
   home) echo "$runner" ;;
   kit) echo "$here" ;;
   env) shift; env_cmd "$@" ;;
+  forget) forget ;;
   inputs) inputs ;;
   lock) lock "${2:-}" ;;
   unlock) unlock "${2:-}" ;;
@@ -755,5 +764,5 @@ case "${1:-status}" in
   pause) shift; pause "$@" ;;
   unpause) shift; unpause "$@" ;;
   ci-events) ci_events "${2:-}" ;;
-  *) echo "usage: bash $0 start|stop [--force]|resume [--force]|status|state|check|account [add [<dir>] [--own]|use <dir>|next [--force]|remove <dir> [--sign-out]|own <dir>|share <dir>|shared on|off]|attach|home|kit|env [KEY=VALUE|-KEY]...|inputs|lock <loop>|unlock <loop>|record [file]|prune|pause [<loop>...]|unpause <loop>...|ci-events [--once]" >&2; exit 2 ;;
+  *) echo "usage: bash $0 start|stop [--force]|resume [--force]|status|state|check|account [add [<dir>] [--own]|use <dir>|next [--force]|remove <dir> [--sign-out]|own <dir>|share <dir>|shared on|off]|attach|home|kit|env [KEY=VALUE|-KEY]...|forget|inputs|lock <loop>|unlock <loop>|record [file]|prune|pause [<loop>...]|unpause <loop>...|ci-events [--once]" >&2; exit 2 ;;
 esac

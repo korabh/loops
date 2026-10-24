@@ -3,7 +3,7 @@ import UserNotifications
 
 @main
 struct LoopsApp: App {
-  @State private var store = Store()
+  @State private var workspace = Workspace()
 
   init() {
     let args = CommandLine.arguments
@@ -18,27 +18,33 @@ struct LoopsApp: App {
 
   var body: some Scene {
     Window("Loops", id: "loops") {
-      LoopsWindow()
-        .environment(store)
+      WorkspaceWindow()
+        .environment(workspace)
         .frame(minWidth: 900, minHeight: 560)
     }
     .defaultSize(width: 1240, height: 820)
     .defaultLaunchBehavior(.presented)
     .commands {
-      LoopsCommands(store: store)
-      ActionCommands(store: store)
+      LoopsCommands(workspace: workspace)
+      ActionCommands(workspace: workspace)
       TableCommands()
     }
 
     MenuBarExtra {
-      MenuBarMenu().environment(store)
+      MenuBarMenu().environment(workspace)
     } label: {
-      let alert = store.phase == .limited || { if case .blocked = store.phase { true } else { false } }()
+      let stores = workspace.projects
+      let alert = stores.contains { s in
+        if case .blocked = s.phase { return true }
+        return s.phase == .limited
+      }
       let icon =
         alert
         ? Image(icon: "exclamationmark.triangle")
-        : Image(nsImage: MenuGlyph.image(working: !store.running.isEmpty, badge: !CI.shared.board.blocked.isEmpty))
-      let waiting = store.inbox.count
+        : Image(
+          nsImage: MenuGlyph.image(
+            working: stores.contains { !$0.running.isEmpty }, badge: stores.contains { !$0.ci.board.blocked.isEmpty }))
+      let waiting = stores.map(\.inbox.count).reduce(0, +)
       if waiting == 0 {
         icon
       } else {
@@ -48,7 +54,7 @@ struct LoopsApp: App {
     .menuBarExtraStyle(.menu)
 
     Settings {
-      SettingsView().environment(store)
+      SettingsView().environment(workspace)
     }
   }
 }

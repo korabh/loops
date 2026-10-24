@@ -40,7 +40,7 @@ private struct ProposeForm: View {
   @State private var idea = ""
   @State private var replacing: FeatureIdea?
 
-  private var planner: Planner { Planner.shared }
+  private var planner: Planner { store.planner }
 
   var body: some View {
     Form {
@@ -213,9 +213,10 @@ private struct ProposeForm: View {
 }
 
 private struct QuestionSection: View {
+  @Environment(Store.self) private var store
   let question: Round.Question
 
-  private var planner: Planner { Planner.shared }
+  private var planner: Planner { store.planner }
 
   var body: some View {
     let answer = planner.answer(question.id)
@@ -257,7 +258,7 @@ private struct DirectionsForm: View {
   @State private var reason = ""
   @State private var replacing: Direction?
 
-  private var directions: Directions { Directions.shared }
+  private var directions: Directions { store.directions }
 
   var body: some View {
     let seen = Directions.fingerprint(store.paths)
@@ -326,10 +327,10 @@ private struct DirectionsForm: View {
               Spacer()
               Button("Dismiss…") { dismissing = d }
               Button("Explore") {
-                if Planner.shared.proposal == nil { directions.explore(d, store: store) } else { replacing = d }
+                if store.planner.proposal == nil { directions.explore(d, store: store) } else { replacing = d }
               }
               .buttonStyle(.borderedProminent)
-              .disabled(Planner.shared.busy != nil)
+              .disabled(store.planner.busy != nil)
             }
           } header: {
             Text("\(d.rung.title) · builds \(d.rung.builds)")
@@ -357,7 +358,7 @@ private struct DirectionsForm: View {
       presenting: replacing
     ) { d in
       Button("Start Over with This Direction", role: .destructive) {
-        Planner.shared.reset()
+        store.planner.reset()
         directions.explore(d, store: store)
       }
     } message: { _ in
@@ -394,7 +395,7 @@ private struct IssuesTable: View {
   @SceneStorage("IssueLineColumns") private var columns: TableColumnCustomization<IssueLine>
   @State private var query = ""
 
-  private var handoffs: Handoffs { Handoffs.shared }
+  private var handoffs: Handoffs { store.handoffs }
 
   var body: some View {
     let q = query.trimmingCharacters(in: .whitespaces)
@@ -459,7 +460,7 @@ private struct HandoffState: View {
   let issue: Issue
   let state: Handoff
 
-  private var handoffs: Handoffs { Handoffs.shared }
+  private var handoffs: Handoffs { store.handoffs }
 
   var body: some View {
     if handoffs.checking.contains(issue.number) || handoffs.queuing.contains(issue.number) {
@@ -495,7 +496,7 @@ private struct HandoffAction: View {
   let issue: Issue
   let state: Handoff
 
-  private var handoffs: Handoffs { Handoffs.shared }
+  private var handoffs: Handoffs { store.handoffs }
 
   var body: some View {
     let busy = handoffs.checking.contains(issue.number) || handoffs.queuing.contains(issue.number)
@@ -503,7 +504,7 @@ private struct HandoffAction: View {
     case .open:
       if let r = handoffs.readiness[issue.number], !r.buildable {
         Button("Sharpen") { sharpen(issue, store: store) }
-          .disabled(Planner.shared.proposal != nil || Planner.shared.busy != nil)
+          .disabled(store.planner.proposal != nil || store.planner.busy != nil)
           .help("Grill it in Propose into a spec that replaces this issue's body")
       } else {
         Button("Build") { Task { await handoffs.build(issue, store: store) } }
@@ -527,7 +528,7 @@ private struct HandoffMenu: View {
   let issue: Issue
   let state: Handoff
 
-  private var handoffs: Handoffs { Handoffs.shared }
+  private var handoffs: Handoffs { store.handoffs }
 
   var body: some View {
     Button("Open Issue", systemImage: "safari") { openURL(issue.url) }

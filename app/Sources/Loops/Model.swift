@@ -105,6 +105,11 @@ struct Paths {
 
   func skill(_ loop: String) -> URL { runner.appending(path: ".claude/skills/\(loop)/SKILL.md") }
 
+  func contains(_ cwd: String?) -> Bool {
+    guard let cwd else { return false }
+    return cwd == repo.path || cwd.hasPrefix(repo.path + "/")
+  }
+
   func tool(_ name: String) -> URL? {
     let url = Paths.bin.appending(path: name)
     return FileManager.default.fileExists(atPath: url.path) ? url : nil

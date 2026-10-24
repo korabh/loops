@@ -90,7 +90,6 @@ struct Runner: Identifiable, Equatable {
 
 @MainActor @Observable
 final class CI {
-  static let shared = CI()
 
   private(set) var runners: [Runner] = []
   private(set) var runs: [CIRun] = []

@@ -6,8 +6,8 @@ struct NewTaskSheet: View {
   @AppStorage("newTaskGoal") private var goal = true
   @FocusState private var focused: Bool
 
-  private var draft: GoalDraft { GoalDraft.shared }
-  private var ideas: GoalIdeas { GoalIdeas.shared }
+  private var draft: GoalDraft { store.goalDraft }
+  private var ideas: GoalIdeas { store.suggestions }
 
   private var trimmed: String { draft.task.trimmingCharacters(in: .whitespacesAndNewlines) }
   private var over: Int { Goal.condition(draft.task, done: draft.done, turns: draft.turns).count - Goal.limit }

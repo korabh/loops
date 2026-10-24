@@ -4,7 +4,7 @@ import UserNotifications
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
   static let shared = NotificationDelegate()
 
-  @MainActor weak var store: Store?
+  @MainActor weak var workspace: Workspace?
 
   func userNotificationCenter(
     _ center: UNUserNotificationCenter, willPresent notification: UNNotification,
@@ -17,12 +17,17 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void
   ) {
     let info = response.notification.request.content.userInfo
+    let project = info["project"] as? String
     let task = info["task"] as? String
     let pr = info["pr"] as? Int
     let action = response.actionIdentifier
     let text = (response as? UNTextInputNotificationResponse)?.userText
     DispatchQueue.main.async {
-      MainActor.assumeIsolated { self.store?.handle(action: action, task: task, pr: pr, text: text) }
+      MainActor.assumeIsolated {
+        guard let w = self.workspace, let store = w.store(project) ?? w.focus else { return }
+        if w.projects.count > 1 { w.selection = store.id }
+        store.handle(action: action, task: task, pr: pr, text: text)
+      }
       completionHandler()
     }
   }

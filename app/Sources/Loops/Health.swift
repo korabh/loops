@@ -110,7 +110,6 @@ struct RetroReport: Decodable, Equatable {
 
 @MainActor @Observable
 final class Health {
-  static let shared = Health()
 
   private(set) var bySkill: [String: SkillHealth] = [:]
   private(set) var loadedAt: [String: Date] = [:]

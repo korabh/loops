@@ -358,7 +358,7 @@ private struct LoopHealth: View {
   let spec: LoopSpec
   @State private var picked: Set<String> = []
 
-  private var health: Health { Health.shared }
+  private var health: Health { store.health }
 
   var body: some View {
     let h = health.bySkill[spec.name]

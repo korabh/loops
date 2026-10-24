@@ -17,7 +17,6 @@ enum Handoff: Equatable {
 
 @MainActor @Observable
 final class Handoffs {
-  static let shared = Handoffs()
 
   private(set) var checking: Set<Int> = []
   private(set) var queuing: Set<Int> = []
@@ -108,7 +107,7 @@ extension Store {
 
   func buildNow(_ issue: Issue) {
     let loop = "loop-issue-queue"
-    let handoffs = Handoffs.shared
+    let handoffs = self.handoffs
     handoffs.failure[issue.number] = nil
     guard !builderBusy else {
       handoffs.failure[issue.number] = "Issue builder is on another issue. It takes #\(issue.number) on a later run."
@@ -124,9 +123,9 @@ extension Store {
 }
 
 @MainActor func sharpen(_ issue: Issue, store: Store) {
-  guard Planner.shared.proposal == nil else {
+  guard store.planner.proposal == nil else {
     store.notice = "Finish or start over the proposal in progress before sharpening #\(issue.number)."
     return
   }
-  Planner.shared.start("#\(issue.number) \(issue.title)", target: issue.number, store: store)
+  store.planner.start("#\(issue.number) \(issue.title)", target: issue.number, store: store)
 }

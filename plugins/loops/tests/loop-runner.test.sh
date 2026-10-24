@@ -355,6 +355,11 @@ expect_contains "a bad name is refused" "$(run env 1X=y)" "not a variable name: 
 run env -LOOPS_PROBE >/dev/null
 expect_eq "env -KEY unsets it" "$(run env)" ""
 
+fixture forget
+expect_contains "a running runner keeps its repo registered" "$(run forget)" "stop it first"
+expect_contains "forget drops a stopped repo from the registry" "$(NO_RUNNER=1 run forget)" "forgot $repo"
+expect_eq "and leaves no entry behind" "$(jq -c --arg r "$repo" '.projects | has($r)' "$HOME/.loops/config.json")" "false"
+
 fixture resume-working
 printf '%s\n' "$$" >"$runner/.claude/loops/watch.pid"
 out=$(AGENT_STATE=working run resume)

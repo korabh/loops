@@ -88,9 +88,16 @@ enum Shell {
 
 @MainActor @Observable
 final class Store {
-  static weak var current: Store?
-
   let paths: Paths
+  let defaults: UserDefaults
+  let ci = CI()
+  let planner: Planner
+  let directions: Directions
+  let suggestions: GoalIdeas
+  let goalDraft = GoalDraft()
+  let handoffs = Handoffs()
+  let health = Health()
+  let recall: Recall
 
   var specs: [LoopSpec] = []
   var project: ProjectConfig?
@@ -125,15 +132,14 @@ final class Store {
   var editing: LoopEdit?
   var proposed: LoopChange?
   var merges: [PullRequest] = []
-  var queued = UserDefaults.standard.dictionary(forKey: "queuedFollowUps") as? [String: String] ?? [:]
+  var queued: [String: String] = [:]
   var changes: [String: ChangeStatus] = [:]
-  private(set) var notifyAll = UserDefaults.standard.bool(forKey: "notifyAll")
+  var notifyAll = UserDefaults.standard.bool(forKey: "notifyAll")
   @ObservationIgnored private var watch: FileWatch?
   @ObservationIgnored private var reloading = false
   @ObservationIgnored private var reloadAgain = false
   @ObservationIgnored private var liveSoon: Task<Void, Never>?
   @ObservationIgnored private var spendSoon: Task<Void, Never>?
-  @ObservationIgnored var hooks: HookServer?
   @ObservationIgnored var hooked: Set<String> = []
   @ObservationIgnored private var activated = Date.distantPast
   @ObservationIgnored var showWindow: (() -> Void)?
@@ -159,25 +165,23 @@ final class Store {
   var page: Page? = .home
   var inboxSelection: String?
   var composing = false
-  private(set) var appearance: Appearance
+  var appearance: Appearance
   private(set) var dismissed: Set<String>
 
-  init() {
-    let info = Bundle.main.infoDictionary
-    let repo =
-      (info?["LoopsRepo"] as? String).map { URL(fileURLWithPath: $0) }
-      ?? Registry.read()?.projects?.keys.sorted().first.map { URL(fileURLWithPath: $0) }
-      ?? FileManager.default.homeDirectoryForCurrentUser
+  init(repo: URL, defaults: UserDefaults) {
     paths = Paths(repo: repo)
-    dismissed = Set(UserDefaults.standard.stringArray(forKey: "dismissed") ?? [])
+    self.defaults = defaults
+    planner = Planner(defaults: defaults)
+    directions = Directions(defaults: defaults)
+    suggestions = GoalIdeas(defaults: defaults)
+    recall = Recall(defaults: defaults)
+    queued = defaults.dictionary(forKey: "queuedFollowUps") as? [String: String] ?? [:]
+    dismissed = Set(defaults.stringArray(forKey: "dismissed") ?? [])
     appearance = Appearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system
     let legacy = (Reader.text(repo.appending(path: ".git/loop-accounts")) ?? "").split(separator: "\n").map(String.init)
     configs = Array(Set((legacy + (Registry.read()?.accounts ?? [])).map { ($0 as NSString).expandingTildeInPath })).sorted()
     jobs = JobWatcher(configs: configs)
-    NotificationDelegate.shared.store = self
-    Store.current = self
     jobs.start()
-    listen()
     loadTasks()
     loadModelPRs()
     Task { await jobs.reconcile() }
@@ -211,8 +215,8 @@ final class Store {
       await refreshLive()
       refreshTasks()
       await refreshSpend()
-      await CI.shared.refreshIfStale(store: self)
-      Planner.shared.wake(store: self)
+      await ci.refreshIfStale(store: self)
+      planner.wake(store: self)
       n += 1
       try? await Task.sleep(for: .seconds(60))
     }
@@ -279,7 +283,7 @@ final class Store {
     guard let announced else { return }
     for n in ready.subtracting(announced) {
       guard let p = pulls[n] else { continue }
-      Notify.post(
+      notify(
         title: "#\(n) is ready to merge", body: p.oneWay ? "\(p.tidyTitle)\nOne-way door: hard to undo." : p.tidyTitle,
         category: Notify.ready, info: ["pr": n])
     }
@@ -388,7 +392,7 @@ final class Store {
       watched.remove(loop)
       let brief = next?.agents(for: loop).first { $0.role == nil }?.brief
       let line = brief.map { Briefs.readable(Briefs.sentences(Briefs.body(Brief(id: 0, at: now, loop: loop, text: $0))).first ?? $0) }
-      Notify.post(title: "\(title(loop)) finished", body: line ?? "Its run is over. Open Loops for the brief.")
+      notify(title: "\(title(loop)) finished", body: line ?? "Its run is over. Open Loops for the brief.")
     }
   }
 
@@ -421,9 +425,7 @@ final class Store {
     Binding(
       get: { self.notifyAll },
       set: { on in
-        self.notifyAll = on
-        UserDefaults.standard.set(on, forKey: "notifyAll")
-        if on { Task { await Notify.authorize() } }
+        if let w = Workspace.current { w.setNotifyAll(on) } else { self.notifyAll = on }
       })
   }
 
@@ -540,7 +542,7 @@ final class Store {
 
   func terminal(_ lines: [String]) {
     let file = FileManager.default.temporaryDirectory.appending(path: "loops-\(UUID().uuidString).command")
-    let body = (["#!/bin/bash", "cd \(quoted(paths.runner.path)) 2>/dev/null"] + lines).joined(separator: "\n") + "\n"
+    let body = (["#!/bin/bash", "cd \(quoted(paths.runner.path)) 2>/dev/null || cd \(quoted(paths.repo.path))"] + lines).joined(separator: "\n") + "\n"
     guard (try? body.write(to: file, atomically: true, encoding: .utf8)) != nil else { return }
     try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
     NSWorkspace.shared.open(file)
@@ -551,9 +553,9 @@ final class Store {
     terminal(["exec bash \(quoted(script.path)) attach"])
   }
 
-  func addAccount() {
+  func addAccount(own: Bool = false) {
     guard let script else { return }
-    terminal(["bash \(quoted(script.path)) account add"])
+    terminal(["bash \(quoted(script.path)) account add\(own ? " --own" : "")"])
   }
 
   private func quoted(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
@@ -567,9 +569,15 @@ final class Store {
   func title(_ name: String) -> String { specs.first { $0.name == name }?.title ?? LoopSpec.short(name) }
 
   func setAppearance(_ a: Appearance) {
-    appearance = a
-    UserDefaults.standard.set(a.rawValue, forKey: "appearance")
-    NSApp.appearance = a.nsAppearance
+    if let w = Workspace.current { w.setAppearance(a) } else { appearance = a }
+  }
+
+  var id: String { paths.repo.path }
+  var name: String { project?.name ?? paths.repo.lastPathComponent }
+
+  func notify(title: String, body: String, category: String? = nil, info: [String: Any] = [:]) {
+    let shared = (Workspace.current?.projects.count ?? 1) > 1
+    notify(title: shared ? "\(name): \(title)" : title, body: body, category: category, info: info.merging(["project": id]) { a, _ in a })
   }
 
   var appearanceBinding: Binding<Appearance> {
@@ -578,13 +586,13 @@ final class Store {
 
   func dismiss(_ ask: Ask) {
     dismissed.insert(ask.id)
-    UserDefaults.standard.set(Array(dismissed), forKey: "dismissed")
+    defaults.set(Array(dismissed), forKey: "dismissed")
     asks.removeAll { $0.id == ask.id }
   }
 
   func restore(_ ids: [String]) {
     dismissed.subtract(ids)
-    UserDefaults.standard.set(Array(dismissed), forKey: "dismissed")
+    defaults.set(Array(dismissed), forKey: "dismissed")
   }
 
   var phase: Phase {

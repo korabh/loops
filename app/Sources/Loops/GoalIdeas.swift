@@ -56,7 +56,6 @@ struct GoalIdea: Identifiable, Codable, Equatable {
 
 @MainActor @Observable
 final class GoalDraft {
-  static let shared = GoalDraft()
 
   var task = ""
   var done = ""
@@ -85,8 +84,6 @@ final class GoalDraft {
 
 @MainActor @Observable
 final class GoalIdeas {
-  static let shared = GoalIdeas()
-
   private(set) var claude: [GoalIdea] = []
   private(set) var at: Date?
   private(set) var busy = false
@@ -111,8 +108,11 @@ final class GoalIdeas {
   private static let rules =
     "A done condition is one sentence a separate judge can check from the conversation alone: name a command that must exit 0 with its output printed, or a number Claude must print in its final message. When the work changes code, end it with: and the change is in an open pull request whose URL is in the final message. Commands run from the repo root; never name an absolute path. No 'Done when' prefix and no turn cap; the app adds the cap."
 
-  private init() {
-    let d = UserDefaults.standard
+  @ObservationIgnored private let defaults: UserDefaults
+
+  init(defaults: UserDefaults) {
+    self.defaults = defaults
+    let d = defaults
     if let data = d.data(forKey: Self.ideasKey), let list = try? JSONDecoder().decode([GoalIdea].self, from: data) { claude = list }
     at = d.object(forKey: Self.atKey) as? Date
     dismissed = Set(d.stringArray(forKey: Self.dismissedKey) ?? [])
@@ -122,12 +122,12 @@ final class GoalIdeas {
 
   func dismiss(_ idea: GoalIdea) {
     dismissed.insert(idea.id)
-    UserDefaults.standard.set(Array(dismissed), forKey: Self.dismissedKey)
+    defaults.set(Array(dismissed), forKey: Self.dismissedKey)
   }
 
   func restore() {
     dismissed = []
-    UserDefaults.standard.removeObject(forKey: Self.dismissedKey)
+    defaults.removeObject(forKey: Self.dismissedKey)
   }
 
   func ask(store: Store) async {
@@ -156,7 +156,7 @@ final class GoalIdeas {
     claude = ideas
     at = Date()
     usage = used
-    let d = UserDefaults.standard
+    let d = defaults
     d.set(try? JSONEncoder().encode(used), forKey: Self.usageKey)
     d.set(try? JSONEncoder().encode(ideas), forKey: Self.ideasKey)
     d.set(at, forKey: Self.atKey)
@@ -250,8 +250,8 @@ extension Store {
           done: goal.done, why: goal.reason.map { "Ended: \($0)" } ?? "It ended before the goal was met.", loop: t.loop,
           turns: min(60, goal.turns * 2)))
     }
-    out += GoalIdeas.shared.claude + spend + GoalIdea.chores(project?.gate ?? [])
-    let dismissed = GoalIdeas.shared.dismissed
+    out += suggestions.claude + spend + GoalIdea.chores(project?.gate ?? [])
+    let dismissed = suggestions.dismissed
     var seen = Set<String>()
     return out.filter { !dismissed.contains($0.id) && !taken($0) && seen.insert($0.id).inserted }
   }

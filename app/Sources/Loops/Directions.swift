@@ -87,8 +87,6 @@ struct Answer: Codable {
 
 @MainActor @Observable
 final class Directions {
-  static let shared = Directions()
-
   static let defaultDestination = "A loop merges its own two-way-door PR, and I review it after it lands."
   static let budget = 5
 
@@ -116,8 +114,11 @@ final class Directions {
   private static let schema =
     #"{"type":"object","additionalProperties":false,"required":["directions"],"properties":{"directions":{"type":"array","maxItems":3,"items":{"type":"object","additionalProperties":false,"required":["question","evidence","gap","rung","notYet"],"properties":{"question":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"gap":{"type":"string"},"rung":{"type":"string","enum":["watch","teach","guard","reshape"]},"notYet":{"type":"string"}}}}}}"#
 
-  private init() {
-    let d = UserDefaults.standard
+  @ObservationIgnored private let defaults: UserDefaults
+
+  init(defaults: UserDefaults) {
+    self.defaults = defaults
+    let d = defaults
     if let data = d.data(forKey: Self.listKey), let saved = try? JSONDecoder().decode([Direction].self, from: data) { list = saved }
     at = d.object(forKey: Self.atKey) as? Date
     usage = d.data(forKey: Self.usageKey).flatMap { try? JSONDecoder().decode(Usage.self, from: $0) }
@@ -137,7 +138,7 @@ final class Directions {
       get: { self.destination },
       set: {
         self.destination = $0
-        UserDefaults.standard.set($0, forKey: Self.destinationKey)
+        self.defaults.set($0, forKey: Self.destinationKey)
       })
   }
 
@@ -224,7 +225,7 @@ final class Directions {
       usage = Usage(result: obj)
       fingerprint = seen
       basis = aim
-      let d = UserDefaults.standard
+      let d = defaults
       d.set(try? JSONEncoder().encode(list), forKey: Self.listKey)
       d.set(at, forKey: Self.atKey)
       d.set(try? JSONEncoder().encode(usage), forKey: Self.usageKey)
@@ -237,11 +238,11 @@ final class Directions {
     dismissed.removeAll { Self.same($0.question, d.question) }
     dismissed.append(
       Dismissal(question: d.question, reason: reason.trimmingCharacters(in: .whitespacesAndNewlines), evidenceCount: d.evidenceCount, at: Date()))
-    UserDefaults.standard.set(try? JSONEncoder().encode(dismissed), forKey: Self.dismissedKey)
+    defaults.set(try? JSONEncoder().encode(dismissed), forKey: Self.dismissedKey)
   }
 
   func explore(_ d: Direction, store: Store) {
-    Planner.shared.start(d.idea(destination: basis ?? Self.defaultDestination), store: store)
+    store.planner.start(d.idea(destination: basis ?? Self.defaultDestination), store: store)
   }
 
   private func heldSignals(_ store: Store) -> String {

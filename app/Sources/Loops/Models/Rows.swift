@@ -281,7 +281,7 @@ extension Store {
       guard let pr = pull(of: t), pr.open else { return nil }
       return (pr, t.loop, pr.createdAt)
     }
-    let problems = CI.shared.problems.map { p in
+    let problems = ci.problems.map { p in
       InboxRow(id: "ci:\(p.id)", kind: .checks, title: p.title, detail: p.detail, at: p.at, source: .problem(p))
     }
     return InboxRow.rows(

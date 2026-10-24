@@ -13,7 +13,7 @@ struct LoopEntity: AppEntity {
 
 struct LoopQuery: EntityStringQuery {
   @MainActor private func all() -> [LoopEntity] {
-    guard let store = Store.current else { return [] }
+    guard let store = Workspace.current?.focus else { return [] }
     let specs = store.specs.isEmpty ? ProjectConfig.read(store.paths.config)?.specs ?? [] : store.specs
     return specs.map { LoopEntity(id: $0.name, title: $0.title) }
   }
@@ -50,7 +50,7 @@ struct RunLoopIntent: AppIntent {
 
   @MainActor
   func perform() async throws -> some IntentResult & ProvidesDialog {
-    guard let store = Store.current else { throw IntentFailure.notReady }
+    guard let store = Workspace.current?.focus else { throw IntentFailure.notReady }
     guard store.running[loop.id] == nil, !store.isStarting(loop.id) else { throw IntentFailure.busy(loop.title) }
     store.runNow(loop.id)
     return .result(dialog: "Started \(loop.title).")
@@ -69,7 +69,7 @@ struct StartTaskIntent: AppIntent {
 
   @MainActor
   func perform() async throws -> some IntentResult & ProvidesDialog {
-    guard let store = Store.current else { throw IntentFailure.notReady }
+    guard let store = Workspace.current?.focus else { throw IntentFailure.notReady }
     store.ask(prompt, loop: loop?.id)
     return .result(dialog: "Claude Code is on it.")
   }
@@ -82,7 +82,7 @@ struct OpenInboxIntent: AppIntent {
 
   @MainActor
   func perform() async throws -> some IntentResult {
-    guard let store = Store.current else { throw IntentFailure.notReady }
+    guard let store = Workspace.current?.focus else { throw IntentFailure.notReady }
     store.page = .inbox
     store.showWindow?()
     NSApp.activate()
@@ -98,7 +98,7 @@ struct OpenLoopIntent: OpenIntent {
 
   @MainActor
   func perform() async throws -> some IntentResult {
-    guard let store = Store.current else { throw IntentFailure.notReady }
+    guard let store = Workspace.current?.focus else { throw IntentFailure.notReady }
     store.page = .loop(target.id)
     store.showWindow?()
     NSApp.activate()

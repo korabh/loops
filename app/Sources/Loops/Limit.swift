@@ -116,9 +116,9 @@ extension Store {
     limit = new
     if let new, old == nil, Date().timeIntervalSince(new.at ?? .distantPast) < 15 * 60 {
       let back = new.resets.map { " Loops are back at \(Clock.day($0, now: Date()))." } ?? ""
-      Notify.post(title: "Loops paused: \(new.kind)", body: "\(account?.email ?? "The runner's account") hit its \(new.kind).\(back)")
+      notify(title: "Loops paused: \(new.kind)", body: "\(account?.email ?? "The runner's account") hit its \(new.kind).\(back)")
     } else if new == nil, old != nil {
-      Notify.post(title: "Loops are running again", body: "The usage limit reset. The runner picks up at its next tick.")
+      notify(title: "Loops are running again", body: "The usage limit reset. The runner picks up at its next tick.")
     }
   }
 }

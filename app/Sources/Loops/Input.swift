@@ -225,12 +225,12 @@ extension Store {
 
   func queue(_ t: BgTask, _ text: String) {
     queued[t.stable] = text
-    UserDefaults.standard.set(queued, forKey: "queuedFollowUps")
+    defaults.set(queued, forKey: "queuedFollowUps")
   }
 
   func unqueue(_ t: BgTask) {
     queued[t.stable] = nil
-    UserDefaults.standard.set(queued, forKey: "queuedFollowUps")
+    defaults.set(queued, forKey: "queuedFollowUps")
   }
 
   func sendQueued() {

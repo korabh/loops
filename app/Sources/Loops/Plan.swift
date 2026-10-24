@@ -52,7 +52,6 @@ struct FeatureIdea: Codable, Equatable, Identifiable {
 
 @MainActor @Observable
 final class Planner {
-  static let shared = Planner()
 
   private(set) var proposal: Proposal?
   private(set) var busy: String?
@@ -93,8 +92,11 @@ final class Planner {
     " This proposal sharpens issue #\(n), which already exists: read it with gh issue view \(n) --comments as the idea. Publish by replacing that issue's body with the spec and adding the ready-for-agent label, not by opening a new issue, then put its URL in `issue`."
   }
 
-  private init() {
-    let d = UserDefaults.standard
+  @ObservationIgnored private let defaults: UserDefaults
+
+  init(defaults: UserDefaults) {
+    self.defaults = defaults
+    let d = defaults
     if let data = d.data(forKey: Self.key), let p = try? JSONDecoder().decode(Proposal.self, from: data) {
       proposal = p
     }
@@ -130,9 +132,9 @@ final class Planner {
       ideas = list
       ideasAt = Date()
       ideasUsage = used
-      UserDefaults.standard.set(try? JSONEncoder().encode(used), forKey: Self.ideasUsageKey)
-      UserDefaults.standard.set(try? JSONEncoder().encode(list), forKey: Self.ideasKey)
-      UserDefaults.standard.set(ideasAt, forKey: Self.ideasAtKey)
+      defaults.set(try? JSONEncoder().encode(used), forKey: Self.ideasUsageKey)
+      defaults.set(try? JSONEncoder().encode(list), forKey: Self.ideasKey)
+      defaults.set(ideasAt, forKey: Self.ideasAtKey)
     }
   }
 
@@ -142,9 +144,9 @@ final class Planner {
 
   private func save() {
     if let proposal, let data = try? JSONEncoder().encode(proposal) {
-      UserDefaults.standard.set(data, forKey: Self.key)
+      defaults.set(data, forKey: Self.key)
     } else {
-      UserDefaults.standard.removeObject(forKey: Self.key)
+      defaults.removeObject(forKey: Self.key)
     }
   }
 

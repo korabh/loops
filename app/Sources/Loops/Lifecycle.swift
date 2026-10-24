@@ -116,16 +116,8 @@ extension Store {
     FileManager.default.fileExists(atPath: hookSettings.path) ? ["--settings", hookSettings.path] : []
   }
 
-  func listen() {
-    let defaults = UserDefaults.standard
-    let token = defaults.string(forKey: "hookToken") ?? UUID().uuidString.lowercased()
-    defaults.set(token, forKey: "hookToken")
-    let server = HookServer(token: token) { [weak self] event in
-      DispatchQueue.main.async { MainActor.assumeIsolated { self?.receive(event) } }
-    }
-    server.start()
-    hooks = server
-    let data = Lifecycle.settings(url: server.url)
+  func useHooks(_ url: String) {
+    let data = Lifecycle.settings(url: url)
     guard FileManager.default.contents(atPath: hookSettings.path) != data else { return }
     if (try? data.write(to: hookSettings, options: .atomic)) != nil {
       try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: hookSettings.path)
@@ -160,6 +152,8 @@ extension Store {
       if e.name != "Notification" { spendLater() }
     }
   }
+
+  func owns(_ e: HookEvent) -> Bool { paths.contains(e.cwd) }
 
   private func fromRunner(_ e: HookEvent) -> Bool {
     if let id = runner?.session?.id, !id.isEmpty, e.session.hasPrefix(id) { return true }

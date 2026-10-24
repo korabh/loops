@@ -54,7 +54,7 @@ struct ChecksPage: View {
   @State private var sortOrder = [KeyPathComparator(\CheckLine.started, order: .reverse)]
   @SceneStorage("CheckLineColumns") private var columns: TableColumnCustomization<CheckLine>
 
-  private var ci: CI { CI.shared }
+  private var ci: CI { store.ci }
 
   var body: some View {
     let all = ci.board.rows + ci.board.neverStarted + ci.board.blocked
@@ -207,7 +207,7 @@ private struct RunnerBar: View {
   @Environment(Store.self) private var store
 
   var body: some View {
-    let ci = CI.shared
+    let ci = store.ci
     HStack(spacing: 16) {
       if ci.runners.isEmpty, ci.loaded {
         Text("No self-hosted runners").foregroundStyle(.secondary)
@@ -267,7 +267,7 @@ private struct RunMenu: View {
   let pr: PullRequest?
 
   var body: some View {
-    let ci = CI.shared
+    let ci = store.ci
     if run.active {
       Button("Cancel Run", systemImage: "xmark") { ci.cancel(run, store: store) }
     } else if run.failed && run.hosted && !run.billingBlocked {

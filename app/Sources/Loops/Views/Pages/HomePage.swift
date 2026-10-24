@@ -246,10 +246,10 @@ struct InboxAction: View {
         Button("Reply", action: open)
       }
     case .problem(let p):
-      if CI.shared.busy(p) {
+      if store.ci.busy(p) {
         ProgressView().controlSize(.small)
       } else if let action = p.action {
-        Button(action) { CI.shared.perform(p, store: store) }
+        Button(action) { store.ci.perform(p, store: store) }
       }
     }
   }
@@ -260,7 +260,7 @@ private struct CatchUpView: View {
   @AppStorage("recallScope") private var scope = RecallScope.away
   @State private var topic = ""
 
-  private var recall: Recall { .shared }
+  private var recall: Recall { store.recall }
 
   var body: some View {
     Form {

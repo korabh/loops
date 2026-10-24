@@ -9,7 +9,7 @@ struct ModelPR: Codable, Equatable {
 
 extension Store {
   func loadModelPRs() {
-    guard let data = UserDefaults.standard.data(forKey: "modelPRs"),
+    guard let data = defaults.data(forKey: "modelPRs"),
       let saved = try? JSONDecoder().decode([String: ModelPR].self, from: data)
     else { return }
     modelPRs = saved
@@ -17,7 +17,7 @@ extension Store {
 
   func recordModelPR(_ loop: String, model: String, url: URL) {
     modelPRs[loop] = ModelPR(model: model, url: url)
-    if let data = try? JSONEncoder().encode(modelPRs) { UserDefaults.standard.set(data, forKey: "modelPRs") }
+    if let data = try? JSONEncoder().encode(modelPRs) { defaults.set(data, forKey: "modelPRs") }
   }
 
   func modelPR(_ loop: String, model: String) -> (pr: ModelPR, pull: PullRequest?)? {
