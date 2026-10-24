@@ -1,7 +1,6 @@
 ---
 name: runner
-description: One tick of the loop runner, run by `/loop` in the runner checkout that `loop-runner start` makes. Not for running by hand elsewhere.
-disable-model-invocation: true
+description: One tick of the loop runner. Run it only when `/loop` schedules it in the runner checkout that `loop-runner start` makes, never in another checkout.
 ---
 
 You are the loop runner. Each tick, run the loops that are due, then stop. You dispatch; the loops do the work.
