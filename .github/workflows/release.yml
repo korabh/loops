@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  app:
+    runs-on: macos-26
+    env:
+      SIGNED: ${{ secrets.DEVELOPER_ID_P12 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: brew install xcodegen
+      - name: Import the Developer ID certificate
+        if: env.SIGNED == 'true'
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_PASSWORD }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          echo "$P12" | base64 --decode >"$RUNNER_TEMP/id.p12"
+          security import "$RUNNER_TEMP/id.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          if [ -n "$NOTARY_KEY" ]; then
+            echo "$NOTARY_KEY" >"$RUNNER_TEMP/notary.p8"
+            echo "LOOPS_NOTARY_KEY=$RUNNER_TEMP/notary.p8" >>"$GITHUB_ENV"
+          fi
+      - name: Package
+        env:
+          LOOPS_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          LOOPS_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: app/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Loops
+          path: app/.build/dist/Loops.dmg
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dmg=app/.build/dist/Loops.dmg
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$dmg" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$dmg" --title "Loops ${GITHUB_REF_NAME#v}" --generate-notes
+          fi

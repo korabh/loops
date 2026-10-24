@@ -4,6 +4,9 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd -P)
 kit=$(cd "$here/.." && pwd -P)
 dest=${1:-$HOME/Applications}
+identity=${LOOPS_IDENTITY:--}
+version=${LOOPS_VERSION:-$(git -C "$kit" describe --tags --abbrev=0 --match 'v*' 2>/dev/null | sed 's/^v//' || true)}
+build=$(git -C "$kit" rev-list --count HEAD 2>/dev/null || echo 1)
 repo_key=""
 if [ -n "${LOOPS_REPO:-}" ]; then repo_key="  <key>LoopsRepo</key><string>$(cd "$LOOPS_REPO" && pwd -P)</string>"; fi
 
@@ -25,7 +28,8 @@ cat >"$plist" <<PLIST
   <key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>${version:-0.0.0}</string>
+  <key>CFBundleVersion</key><string>$build</string>
   <key>NSHumanReadableCopyright</key><string>Developed by Korab Hoxha</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
 $repo_key
@@ -48,7 +52,11 @@ iconutil -c icns "$icons" -o "$app/Contents/Resources/Loops.icns"
 mkdir -p "$app/Contents/Resources/bin"
 cp "$kit"/plugins/loops/bin/* "$app/Contents/Resources/bin/"
 chmod +x "$app/Contents/Resources/bin/"*
-codesign --force --sign - "$app" >/dev/null 2>&1
+if [ "$identity" = - ]; then
+  codesign --force --sign - "$app" >/dev/null 2>&1
+else
+  codesign --force --options runtime --timestamp --sign "$identity" "$app"
+fi
 mkdir -p "$dest"
 rm -rf "$dest/Loops.app"
 cp -R "$app" "$dest/Loops.app"

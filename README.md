@@ -69,12 +69,19 @@ The loops load these skills when the repo or your user folder has them, and read
 
 ## The app
 
+[Download Loops.dmg](https://github.com/korabh/loops/releases/latest/download/Loops.dmg), open it and drag Loops to Applications. It needs macOS 26. It shows every repo registered on the Mac, adds more with Add Project…, and carries its own copy of the runner scripts.
+
+Until releases are notarized, macOS blocks the first launch: open it from System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Loops.app`.
+
+To build it yourself, with Xcode 26 and `xcodegen`:
+
 ```bash
-cd app && ./build.sh            # builds Loops.app into ~/Applications
-LOOPS_REPO=~/code/shop ./build.sh   # pins the repo it shows
+cd app && ./build.sh                # builds Loops.app into ~/Applications
+LOOPS_REPO=~/code/shop ./build.sh   # and pins a repo
+./package.sh                        # builds Loops.dmg into app/.build/dist
 ```
 
-It needs Xcode 26 and `xcodegen`. Without `LOOPS_REPO` it shows the first repo registered in `~/.loops/config.json`. The app carries its own copy of the runner scripts.
+`package.sh` signs with the keychain's Developer ID Application identity (`LOOPS_IDENTITY` picks another, `-` signs ad hoc) and notarizes when `LOOPS_NOTARY_PROFILE` names a `notarytool` profile. Pushing a `v*` tag runs the Release workflow, which attaches Loops.dmg to a GitHub release, signed and notarized once the repo has the `DEVELOPER_ID_P12`, `DEVELOPER_ID_PASSWORD`, `NOTARY_KEY`, `NOTARY_KEY_ID` and `NOTARY_ISSUER` secrets.
 
 ## Develop
 
