@@ -34,7 +34,7 @@ expect_missing() {
 mkdir -p "$WORK/bin"
 cat >"$WORK/bin/claude" <<'SH'
 #!/usr/bin/env bash
-printf '%s|%s\n' "${CLAUDE_CONFIG_DIR-default}" "$*" >>"$CALLS"
+printf '%s|%s|%s\n' "${CLAUDE_CONFIG_DIR-default}" "$*" "${LOOPS_PROBE-}" >>"$CALLS"
 conf="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 case "$1 ${2:-}" in
   "agents "*) if [ -n "${NO_RUNNER:-}" ]; then echo '[]'; else printf '[{"name":"loop-runner","id":"abc12345","sessionId":"%s","state":"%s","status":"idle"%s}]\n' "${RUNNER_SESSION-s}" "${AGENT_STATE:-idle}" "${AGENT_CWD:+,\"cwd\":\"$AGENT_CWD\"}"; fi ;;
@@ -343,6 +343,17 @@ printf 'own prompt\n' >"$runner/.claude/loop.md"
 AGENT_STATE=blocked run resume >/dev/null
 expect_contains "a repo's own .claude/loop.md replaces the plugin's runner prompt" "$(cat "$CALLS")" "/loop 2h"
 expect_missing "and the plugin's prompt is not named" "$(cat "$CALLS")" "/loops:runner"
+
+fixture machine-env
+printf '%s\n' "$$" >"$runner/.claude/loops/watch.pid"
+expect_contains "env sets a variable for this repo's runner" "$(run env LOOPS_PROBE=on-this-mac)" "LOOPS_PROBE is set for this repo's runner"
+expect_eq "env lists what is set" "$(run env)" "LOOPS_PROBE=on-this-mac"
+AGENT_STATE=blocked run resume >/dev/null
+expect_contains "the runner session gets the repo's machine variables" "$(cat "$CALLS")" "--bg --name loop-runner"
+expect_contains "with their values" "$(grep -- '--bg' "$CALLS")" "|on-this-mac"
+expect_contains "a bad name is refused" "$(run env 1X=y)" "not a variable name: 1X"
+run env -LOOPS_PROBE >/dev/null
+expect_eq "env -KEY unsets it" "$(run env)" ""
 
 fixture resume-working
 printf '%s\n' "$$" >"$runner/.claude/loops/watch.pid"

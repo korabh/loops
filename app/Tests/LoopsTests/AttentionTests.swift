@@ -58,27 +58,6 @@ private func problem(_ id: String) -> InboxRow {
     #expect(Holder.of(.checks) == .checks)
   }
 
-  @Test func theSegmentsCountTheInboxAndTheLoopsWorkApart() {
-    let inbox = [
-      prRow(pull(1)), prRow(pull(2), kind: .fix), decision("d1", "Pick a name", at: now), task("t"), problem("billing"),
-      decision("d2", "Pick a colour", at: now),
-    ]
-    let pulls = [pull(1), pull(2), pull(3), pull(4), pull(5, branch: "feat/mine"), pull(6, state: "MERGED")]
-    let shares = Attention.shares(inbox: inbox, pulls: pulls)
-    #expect(shares.map(\.holder) == Holder.allCases)
-    #expect(shares.map(\.count) == [1, 1, 3, 1, 2])
-    #expect(shares.map(\.first) == ["pr-1", "pr-2", "d1", "ci:billing", nil])
-    #expect(shares.prefix(4).map(\.count).reduce(0, +) == inbox.count)
-  }
-
-  @Test func segmentsSitEndToEndAndSkipEmptyHolders() {
-    let shares = [Share(holder: .merge, count: 2), Share(holder: .fix), Share(holder: .decide, count: 3), Share(holder: .loops, count: 1)]
-    let segments = Attention.segments(shares)
-    #expect(segments.map(\.holder) == [.merge, .decide, .loops])
-    #expect(segments.map(\.start) == [0, 2, 5])
-    #expect(segments.map(\.end) == [2, 5, 6])
-  }
-
   @Test func mergedCountsLoopPullRequestsFromTheLastSevenDays() {
     let pulls = [
       pull(10, state: "MERGED", merged: now.addingTimeInterval(-86400)),
@@ -135,18 +114,6 @@ private func problem(_ id: String) -> InboxRow {
     #expect(recent.first?.age == "1h")
   }
 
-  @Test func dayTicksFallOnMidnightsInsideTheSpan() {
-    var cal = Calendar(identifier: .gregorian)
-    cal.timeZone = TimeZone(identifier: "UTC")!
-    let start = cal.date(from: DateComponents(year: 2027, month: 1, day: 3, hour: 9))!
-    let ticks = Attention.ticks(from: start, to: start.addingTimeInterval(13 * 86400), calendar: cal)
-    #expect(ticks.first == cal.date(from: DateComponents(year: 2027, month: 1, day: 4)))
-    #expect(ticks.allSatisfy { cal.component(.hour, from: $0) == 0 })
-    #expect((3...6).contains(ticks.count))
-    let hours = Attention.ticks(from: start, to: start.addingTimeInterval(6 * 3600), calendar: cal)
-    #expect(hours.first == cal.date(from: DateComponents(year: 2027, month: 1, day: 3, hour: 10)))
-    #expect(Attention.ticks(from: start, to: start, calendar: cal).isEmpty)
-  }
 }
 
 @Suite struct Waits {

@@ -67,14 +67,6 @@ enum Attention {
     return out
   }
 
-  static func segments(_ shares: [Share]) -> [(holder: Holder, start: Double, end: Double)] {
-    var at = 0.0
-    return shares.filter { $0.count > 0 }.map { s in
-      defer { at += Double(s.count) }
-      return (s.holder, at, at + Double(s.count))
-    }
-  }
-
   static func merged(_ pulls: [PullRequest], now: Date) -> Int {
     let week = now.addingTimeInterval(-7 * 86400)
     return pulls.filter { pr in pr.merged && pr.loop != nil && pr.mergedAt.map { $0 >= week && $0 <= now } ?? false }.count
@@ -120,22 +112,6 @@ enum Attention {
     return plural(Int((Double(m) / 1440).rounded()), "day")
   }
 
-  static func ticks(from start: Date, to end: Date, calendar: Calendar = .current) -> [Date] {
-    let span = end.timeIntervalSince(start)
-    guard span > 0 else { return [] }
-    let hourly = span < 2 * 86400
-    let unit: Calendar.Component = hourly ? .hour : .day
-    let step = max(1, Int((span / (hourly ? 3600 : 86400) / 5).rounded(.up)))
-    guard var t = calendar.dateInterval(of: unit, for: start)?.end else { return [] }
-    if !hourly { t = calendar.startOfDay(for: t) }
-    var out: [Date] = []
-    while t < end {
-      out.append(t)
-      guard let next = calendar.date(byAdding: unit, value: step, to: t) else { break }
-      t = next
-    }
-    return out
-  }
 }
 
 struct Wait: Identifiable, Equatable {

@@ -21,9 +21,6 @@ struct HomePage: View {
           open: open
         )
         .redacted(reason: loaded ? [] : .placeholder)
-        if loaded, !waits.isEmpty {
-          WaitTimeline(waits: waits, now: store.now, open: open)
-        }
       } header: {
         Text("Needs You")
       } footer: {

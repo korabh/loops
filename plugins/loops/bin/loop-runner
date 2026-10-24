@@ -65,6 +65,29 @@ known() { jq -r '(.shared // [])[], (.projects[]?.own // [])[]' "$reg" 2>/dev/nu
 
 owner() { jq -r --arg d "$1" '[.projects | to_entries[] | select((.value.own // []) | index($d)) | .key][0] // empty' "$reg" 2>/dev/null; }
 
+machine_env() {
+  while IFS= read -r kv; do
+    [ -n "$kv" ] && export "${kv?}"
+  done < <(jq -r --arg p "$main" '.projects[$p].env // {} | to_entries[] | "\(.key)=\(.value)"' "$reg" 2>/dev/null)
+}
+
+env_cmd() {
+  if [ $# -eq 0 ]; then
+    jq -r --arg p "$main" '.projects[$p].env // {} | to_entries[] | "\(.key)=\(.value)"' "$reg" 2>/dev/null
+    return
+  fi
+  for kv; do
+    case "$kv" in
+      -*) edit --arg k "${kv#-}" '.projects[$p].env |= ((. // {}) | del(.[$k]))' && echo "unset ${kv#-} for this repo's runner" ;;
+      *=*)
+        [[ "${kv%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "not a variable name: ${kv%%=*}" >&2; return 2; }
+        edit --arg k "${kv%%=*}" --arg v "${kv#*=}" '.projects[$p].env = ((.projects[$p].env // {}) + {($k): $v})' && echo "${kv%%=*} is set for this repo's runner; it takes effect at the next start or resume"
+        ;;
+      *) echo "usage: loop-runner env [KEY=VALUE | -KEY]..." >&2; return 2 ;;
+    esac
+  done
+}
+
 load() {
   account=$(cat "$active" 2>/dev/null)
   [ -n "$account" ] || account=$(rotation | head -n 1)
@@ -329,7 +352,7 @@ start() {
   git -C "$runner" fetch -q origin
   if [ -z "$(git -C "$runner" status --porcelain --untracked-files=no)" ]; then git -C "$runner" switch -q --detach origin/main; fi
   install=$(cfg .setup.install)
-  if [ -n "$install" ]; then (cd "$runner" && bash -c "$install" >/dev/null) || return 1; fi
+  if [ -n "$install" ]; then (cd "$runner" && machine_env && bash -c "$install" >/dev/null) || return 1; fi
   cfg '.setup.copy[]?' | while IFS= read -r f; do
     if [ -f "$main/$f" ] && [ ! -f "$runner/$f" ]; then mkdir -p "$(dirname "$runner/$f")" && cp "$main/$f" "$runner/$f"; fi
   done
@@ -356,7 +379,7 @@ spawn() {
   model=$(cfg .runner.model)
   every=$(cfg .runner.every)
   if [ -f "$runner/.claude/loop.md" ]; then tick="/loop ${every:-1h}"; else tick="/loop ${every:-1h} /loops:runner"; fi
-  (cd "$runner" && cl --bg --name loop-runner --model "${model:-sonnet}" --permission-mode auto "$@" "$tick")
+  (cd "$runner" && machine_env && cl --bg --name loop-runner --model "${model:-sonnet}" --permission-mode auto "$@" "$tick")
 }
 
 launch() { spawn --remote-control loop-runner || { [ -n "$(session)" ] || spawn; }; }
@@ -723,6 +746,7 @@ case "${1:-status}" in
   attach) id=$(sid) && [ -n "$id" ] && cd "$runner" && cl attach "$id" ;;
   home) echo "$runner" ;;
   kit) echo "$here" ;;
+  env) shift; env_cmd "$@" ;;
   inputs) inputs ;;
   lock) lock "${2:-}" ;;
   unlock) unlock "${2:-}" ;;
@@ -731,5 +755,5 @@ case "${1:-status}" in
   pause) shift; pause "$@" ;;
   unpause) shift; unpause "$@" ;;
   ci-events) ci_events "${2:-}" ;;
-  *) echo "usage: bash $0 start|stop [--force]|resume [--force]|status|state|check|account [add [<dir>] [--own]|use <dir>|next [--force]|remove <dir> [--sign-out]|own <dir>|share <dir>|shared on|off]|attach|home|kit|inputs|lock <loop>|unlock <loop>|record [file]|prune|pause [<loop>...]|unpause <loop>...|ci-events [--once]" >&2; exit 2 ;;
+  *) echo "usage: bash $0 start|stop [--force]|resume [--force]|status|state|check|account [add [<dir>] [--own]|use <dir>|next [--force]|remove <dir> [--sign-out]|own <dir>|share <dir>|shared on|off]|attach|home|kit|env [KEY=VALUE|-KEY]...|inputs|lock <loop>|unlock <loop>|record [file]|prune|pause [<loop>...]|unpause <loop>...|ci-events [--once]" >&2; exit 2 ;;
 esac
