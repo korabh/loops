@@ -2,6 +2,7 @@ import SwiftUI
 
 struct LoopsWindow: View {
   @Environment(Store.self) private var store
+  @Environment(Workspace.self) private var workspace
   @Environment(\.openWindow) private var openWindow
   @State private var query = ""
 
@@ -9,12 +10,12 @@ struct LoopsWindow: View {
     @Bindable var store = store
     NavigationSplitView {
       Sidebar(query: query)
-        .safeAreaBar(edge: .top) { ProjectPicker() }
         .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
         .searchable(text: $query, placement: .sidebar, prompt: "Search")
     } detail: {
       Detail(page: store.page ?? .home)
     }
+    .toolbar { ProjectSwitcher(workspace: workspace) }
     .task { await store.refresh() }
     .onAppear { store.showWindow = { openWindow(id: "loops") } }
     .sheet(item: $store.editing) { mode in

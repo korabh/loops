@@ -10,6 +10,7 @@ final class Workspace {
     didSet { UserDefaults.standard.set(selection, forKey: Self.selectionKey) }
   }
   var adding = false
+  var choosing = false
   var problem: String?
   @ObservationIgnored private var server: HookServer?
 

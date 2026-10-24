@@ -4,40 +4,65 @@ struct WorkspaceWindow: View {
   @Environment(Workspace.self) private var workspace
 
   var body: some View {
-    if workspace.projects.isEmpty {
-      NoProjects()
-    } else if workspace.all {
-      AllProjectsWindow()
-    } else if let store = workspace.focus {
-      LoopsWindow().environment(store).id(store.id)
+    @Bindable var workspace = workspace
+    Group {
+      if workspace.projects.isEmpty {
+        NoProjects()
+      } else if workspace.all {
+        AllProjectsWindow()
+      } else if let store = workspace.focus {
+        LoopsWindow().environment(store).id(store.id)
+      }
+    }
+    .fileImporter(isPresented: $workspace.choosing, allowedContentTypes: [.folder]) { result in
+      if case .success(let url) = result { workspace.add(url) }
     }
   }
 }
 
-struct ProjectPicker: View {
-  @Environment(Workspace.self) private var workspace
+struct ProjectSwitcher: ToolbarContent {
+  let workspace: Workspace
 
-  var body: some View {
-    @Bindable var workspace = workspace
-    if workspace.projects.count > 1 {
-      Picker("Project", selection: $workspace.selection) {
-        Label("All Projects", icon: "square.stack").tag(String?.none)
-        Divider()
-        ForEach(workspace.ordered, id: \.id) { s in
-          Text(s.name).tag(Optional(s.id))
+  var body: some ToolbarContent {
+    ToolbarItem(placement: .navigation) {
+      Menu {
+        if workspace.projects.count > 1 {
+          Toggle(isOn: Binding(get: { workspace.selection == nil }, set: { if $0 { workspace.selection = nil } })) {
+            Text("All Projects")
+            Text(Self.status(workspace.projects))
+          }
+          .keyboardShortcut("0", modifiers: [.command, .control])
+          Divider()
         }
+        ForEach(Array(workspace.ordered.enumerated()), id: \.element.id) { i, s in
+          Toggle(isOn: Binding(get: { workspace.active?.id == s.id }, set: { if $0 { workspace.selection = s.id } })) {
+            Text(s.name)
+            Text(Self.status([s]))
+          }
+          .keyboardShortcut(i < 9 ? KeyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: [.command, .control]) : nil)
+        }
+        Divider()
+        Button("Add Project…", systemImage: "plus") { workspace.choosing = true }
+        SettingsLink { Label("Manage Projects…", systemImage: "gearshape") }
+      } label: {
+        Label(workspace.active?.name ?? "All Projects", icon: workspace.active == nil ? "square.stack" : "folder")
+          .labelStyle(.titleAndIcon)
       }
-      .labelsHidden()
-      .pickerStyle(.menu)
-      .padding(.horizontal, 10)
-      .padding(.vertical, 6)
+      .help("Switch project")
     }
+  }
+
+  static func status(_ stores: [Store]) -> String {
+    let running = stores.map(\.running.count).reduce(0, +)
+    let waiting = stores.map(\.inbox.count).reduce(0, +)
+    let parts = [running > 0 ? "\(running) running" : nil, waiting > 0 ? "\(waiting) waiting on you" : nil].compactMap { $0 }
+    if !parts.isEmpty { return parts.joined(separator: " · ") }
+    return stores.count == 1 ? stores[0].phase.label : "Nothing waiting"
   }
 }
 
 private struct NoProjects: View {
   @Environment(Workspace.self) private var workspace
-  @State private var choosing = false
 
   var body: some View {
     ContentUnavailableView {
@@ -45,11 +70,8 @@ private struct NoProjects: View {
     } description: {
       Text(workspace.problem ?? "Add a git repository whose loops this Mac runs.")
     } actions: {
-      Button("Add Project…") { choosing = true }
+      Button("Add Project…") { workspace.choosing = true }
         .disabled(workspace.adding)
-    }
-    .fileImporter(isPresented: $choosing, allowedContentTypes: [.folder]) { result in
-      if case .success(let url) = result { workspace.add(url) }
     }
   }
 }
@@ -84,7 +106,6 @@ private struct AllProjectsWindow: View {
           }
         }
       }
-      .safeAreaBar(edge: .top) { ProjectPicker() }
       .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
     } detail: {
       switch page ?? .home {
@@ -94,6 +115,7 @@ private struct AllProjectsWindow: View {
       case .loop: Color.clear
       }
     }
+    .toolbar { ProjectSwitcher(workspace: workspace) }
     .onChange(of: page) { _, new in
       if case .loop(let id, let name)? = new { workspace.open(id, .loop(name)) }
     }
