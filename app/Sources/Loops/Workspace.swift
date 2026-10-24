@@ -142,9 +142,17 @@ final class Workspace {
     let standard = UserDefaults.standard
     guard !standard.bool(forKey: Self.migratedKey) else { return }
     let pinned = Bundle.main.infoDictionary?["LoopsRepo"] as? String
-    guard let target = pinned.flatMap({ wanted.contains($0) ? $0 : nil }) ?? wanted.first else { return }
+    guard let target = pinned.flatMap({ wanted.contains($0) ? $0 : nil }) ?? Self.home(of: standard.data(forKey: "tasks"), among: wanted) ?? wanted.first
+    else { return }
     Self.carry(Self.projectKeys, from: standard, to: Self.defaults(for: target))
     standard.set(true, forKey: Self.migratedKey)
+  }
+
+  static func home(of tasks: Data?, among repos: [String]) -> String? {
+    guard let tasks, let list = (try? JSONSerialization.jsonObject(with: tasks)) as? [[String: Any]] else { return nil }
+    let cwds = list.compactMap { $0["cwd"] as? String }
+    let counts = repos.map { r in (r, cwds.filter { $0 == r || $0.hasPrefix(r + "/") }.count) }
+    return counts.filter { $0.1 > 0 }.max { $0.1 < $1.1 }?.0
   }
 
   static func carry(_ keys: [String], from: UserDefaults, to: UserDefaults) {

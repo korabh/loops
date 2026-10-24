@@ -39,3 +39,10 @@ import Testing
     #expect(Workspace.projectKeys.contains(key))
   }
 }
+
+@MainActor @Test func theOldSettingsGoToTheRepoTheirTasksRanIn() {
+  let tasks = Data(#"[{"cwd":"/code/shop"},{"cwd":"/code/shop/.claude/worktrees/ask-1"},{"cwd":"/code/blog"}]"#.utf8)
+  #expect(Workspace.home(of: tasks, among: ["/code/blog", "/code/shop"]) == "/code/shop")
+  #expect(Workspace.home(of: nil, among: ["/code/blog"]) == nil)
+  #expect(Workspace.home(of: Data("[]".utf8), among: ["/code/blog"]) == nil)
+}
