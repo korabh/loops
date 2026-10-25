@@ -198,7 +198,7 @@ struct LoopEditor: View {
 
   private var title: String {
     switch mode {
-    case .add: "New loop"
+    case .add: "New Loop"
     case .edit(let l): "Edit \(l.title)"
     case .remove(let l): "Remove \(l.title)"
     }
@@ -286,7 +286,7 @@ struct LoopEditor: View {
       Form {
         if store.adminScript == nil {
           Section {
-            Label("The admin script isn't on this Mac yet", systemImage: "exclamationmark.triangle")
+            Label("The admin script isn't on this Mac yet", icon: "exclamationmark.triangle")
               .help("Waiting on loop-admin, which turns this into a pull request. You can fill this in now.")
           }
         }
@@ -294,7 +294,7 @@ struct LoopEditor: View {
       }
       .formStyle(.grouped)
     }
-    .frame(width: 600, height: mode.isRemove ? 380 : 700)
+    .presentationSizing(.form)
     .disabled(busy)
     .toolbar {
       ToolbarItem(placement: .cancellationAction) {
@@ -352,7 +352,7 @@ struct LoopEditor: View {
         TextField("Name", text: $draft.title, prompt: Text("Coverage hunter"))
           .help("Shows in Loops and in notifications")
         if !draft.title.isEmpty && !titleOK {
-          Label("Letters, numbers, spaces and & + . / - only.", systemImage: "exclamationmark.circle")
+          Label("Letters, numbers, spaces and & + . / - only.", icon: "exclamationmark.circle")
             .foregroundStyle(.red)
             .help("Use letters, numbers, spaces and & + . / -, starting with a letter or number.")
         }
@@ -360,7 +360,7 @@ struct LoopEditor: View {
           HStack(spacing: 6) {
             Text(name).foregroundStyle(.secondary).textSelection(.enabled)
             if taken {
-              Label("Already used", systemImage: "xmark.circle").foregroundStyle(.red)
+              Label("Already used", icon: "xmark.circle").foregroundStyle(.red)
             }
           }
         }
@@ -458,7 +458,7 @@ struct LoopEditor: View {
     }
     if let error {
       Section {
-        Label(error, systemImage: "exclamationmark.triangle")
+        Label(error, icon: "exclamationmark.triangle")
           .foregroundStyle(.red)
           .lineLimit(2)
           .help(error)
@@ -469,7 +469,7 @@ struct LoopEditor: View {
         LabeledContent {
           Button("Open PR") { openURL(opened) }
         } label: {
-          Label("Pull request opened", systemImage: "checkmark.circle")
+          Label("Pull request opened", icon: "checkmark.circle")
         }
       }
     }

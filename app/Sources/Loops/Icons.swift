@@ -140,8 +140,31 @@ extension Image {
 }
 
 extension Label where Title == Text, Icon == Image {
-  @MainActor init<S: StringProtocol>(_ title: S, icon symbol: String) {
-    self.init { Text(title) } icon: { Image(icon: symbol) }
+  @MainActor init<S: StringProtocol>(_ title: S, icon symbol: String, size: CGFloat = 16) {
+    self.init { Text(title) } icon: { Image(icon: symbol, size: size) }
+  }
+}
+
+extension SidebarRowSize {
+  var icon: CGFloat {
+    switch self {
+    case .small: 14
+    case .large: 20
+    default: 16
+    }
+  }
+}
+
+extension EnvironmentValues {
+  @Entry var iconSize: CGFloat = 14
+}
+
+struct RowIcon: View {
+  @Environment(\.iconSize) private var size
+  let symbol: String
+
+  var body: some View {
+    Image(icon: symbol, size: size)
   }
 }
 

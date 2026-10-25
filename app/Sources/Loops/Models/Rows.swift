@@ -62,7 +62,7 @@ enum LoopStatus: Equatable {
   var active: Bool { rank < 2 }
 }
 
-struct InboxRow: Identifiable {
+struct InboxRow: Identifiable, Equatable {
   enum Kind: Int, CaseIterable, Identifiable {
     case answer, merge, fix, decide, checks
 
@@ -90,15 +90,14 @@ struct InboxRow: Identifiable {
 
     var tint: Color {
       switch self {
-      case .answer, .decide: .orange
+      case .answer, .decide, .fix: .orange
       case .merge: .green
-      case .fix: .secondary
       case .checks: .red
       }
     }
   }
 
-  enum Source {
+  enum Source: Equatable {
     case task(BgTask)
     case item(Item)
     case problem(CIProblem)
@@ -263,29 +262,38 @@ extension Store {
   func task(stable: String) -> BgTask? { tasks.first { $0.stable == stable } }
 
   var sidebarTasks: [BgTask] {
-    let open = tasks.filter { phase($0).open }
-    let recent = tasks.filter { !phase($0).open && now.timeIntervalSince($0.started) < 86400 }
+    let phased = tasks.map { (task: $0, open: phase($0).open) }
+    let open = phased.filter(\.open).map(\.task)
+    let recent = phased.filter { !$0.open && now.timeIntervalSince($0.task.started) < 86400 }.map(\.task)
     return Array((open + recent).prefix(8))
   }
 
-  var inbox: [InboxRow] {
-    let answers = needsInput.map { t in
+  func inboxRows() -> [InboxRow] {
+    Store.inbox(
+      tasks: tasks, input: shownInput, updated: { self.jobs.jobs[$0.id]?.updated }, pull: pull(of:), outcomes: outcomes, items: items,
+      problems: ci.problems, state: mergeState, loopTitle: title)
+  }
+
+  static func inbox(
+    tasks: [BgTask], input: (BgTask) -> PendingInput?, updated: (BgTask) -> Date?, pull: (BgTask) -> PullRequest?,
+    outcomes: [Outcome], items: [Item], problems: [CIProblem], state: (PullRequest) -> MergeState, loopTitle: (String) -> String
+  ) -> [InboxRow] {
+    let answers = tasks.filter(\.needsYou).map { t in
       InboxRow(
-        id: "task:\(t.stable)", kind: .answer, title: pendingInput(t)?.title ?? "It needs your answer", detail: Store.short(t),
-        at: jobs.jobs[t.id]?.updated ?? t.started, loop: t.loop, source: .task(t))
+        id: "task:\(t.stable)", kind: .answer, title: input(t)?.title ?? "It needs your answer", detail: short(t),
+        at: updated(t) ?? t.started, loop: t.loop, source: .task(t))
     }
     let loopPRs = outcomes.filter { $0.kind == .pull && !$0.done && $0.actor == "You" }.compactMap { o in
       o.pr.map { (pr: $0, loop: Optional(o.loop), at: Optional(o.at)) }
     }
     let taskPRs = tasks.compactMap { t -> (pr: PullRequest, loop: String?, at: Date?)? in
-      guard let pr = pull(of: t), pr.open else { return nil }
+      guard let pr = pull(t), pr.open else { return nil }
       return (pr, t.loop, pr.createdAt)
     }
-    let problems = ci.problems.map { p in
+    let checks = problems.map { p in
       InboxRow(id: "ci:\(p.id)", kind: .checks, title: p.title, detail: p.detail, at: p.at, source: .problem(p))
     }
-    return InboxRow.rows(
-      answers: answers, items: items, waiting: loopPRs + taskPRs, problems: problems, state: mergeState, loopTitle: title)
+    return InboxRow.rows(answers: answers, items: items, waiting: loopPRs + taskPRs, problems: checks, state: state, loopTitle: loopTitle)
   }
 
   static func headline(_ t: BgTask) -> String {

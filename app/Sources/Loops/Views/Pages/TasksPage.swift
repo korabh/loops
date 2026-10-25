@@ -29,15 +29,16 @@ struct TasksPage: View {
         cost: spent?.cost ?? 0, tokens: spent?.total ?? 0)
     }
     .sorted(using: sortOrder)
-    let open = rows.filter { $0.phase.open }.count
     let picked = rows.filter { selection.contains($0.id) }.map(\.task)
     let prs = picked.compactMap { store.pull(of: $0) }
     Table(rows, selection: $selection, sortOrder: $sortOrder, columnCustomization: $columns) {
       TableColumn("Title", value: \TaskLine.title) { r in Text(r.title).help(r.task.prompt) }
         .width(min: 200, ideal: 340)
         .customizationID("title")
+        .disabledCustomizationBehavior(.visibility)
       TableColumn("Kind", value: \TaskLine.kind).width(min: 40, ideal: 56)
         .customizationID("kind")
+        .defaultVisibility(.hidden)
       TableColumn("Loop", value: \TaskLine.loop).width(min: 60, ideal: 110)
         .customizationID("loop")
       TableColumn("Status", value: \TaskLine.rank) { r in
@@ -65,6 +66,7 @@ struct TasksPage: View {
       }
       .width(min: 50, ideal: 70)
       .customizationID("tokens")
+      .defaultVisibility(.hidden)
       TableColumn("PR") { r in
         if let pr = store.pull(of: r.task) {
           Button { openURL(pr.url) } label: { Text(verbatim: "#\(pr.number)") }.buttonStyle(.link)
@@ -72,6 +74,7 @@ struct TasksPage: View {
       }
       .width(min: 44, ideal: 60)
       .customizationID("pr")
+      .defaultVisibility(.hidden)
     }
     .tableAppearance()
     .contextMenu(forSelectionType: String.self) { ids in
@@ -79,26 +82,23 @@ struct TasksPage: View {
     } primaryAction: { ids in
       if let id = ids.first { store.page = .task(id) }
     }
+    .onDeleteCommand { Removals.shared.ask(picked, in: store) }
     .copyable(prs.map(\.url))
     .focusedSceneValue(\.selected, Selected(urls: prs.map(\.url), pulls: prs, tasks: picked))
     .overlay {
       if rows.isEmpty {
-        ContentUnavailableView {
-          Label { Text("No Tasks") } icon: { Image(icon: "checklist", size: 32) }
-        } description: {
-          Text("Tasks run Claude Code in the background, in their own worktree.")
-        } actions: {
+        EmptyState(title: "No Tasks", icon: "checklist", detail: "Tasks run Claude Code in the background, in their own worktree.") {
           Button("New Task…") { store.composing = true }
         }
       }
     }
-    .navigationTitle("Tasks")
-    .navigationSubtitle(open > 0 ? "\(open) open" : "")
+    .pageTitle("Tasks")
     .toolbar {
-      ToolbarSpacer(.flexible)
       ToolbarItem {
         Button("New Task…", icon: "plus") { store.composing = true }
+          .help("Start a Claude Code task in the background")
       }
+      ToolbarSpacer(.fixed)
       ToolbarItem { TableViewMenu() }
     }
   }

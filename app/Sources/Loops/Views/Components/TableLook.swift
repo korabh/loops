@@ -22,6 +22,14 @@ enum RowSize: String, CaseIterable, Identifiable {
     }
   }
 
+  var icon: CGFloat {
+    switch self {
+    case .small: 12
+    case .medium: 14
+    case .large: 18
+    }
+  }
+
   var control: ControlSize {
     switch self {
     case .small: .small
@@ -57,6 +65,7 @@ private struct TableAppearance: ViewModifier {
       .font(size.font)
       .controlSize(size.control)
       .environment(\.defaultMinListRowHeight, size.height)
+      .environment(\.iconSize, size.icon)
   }
 
   @ViewBuilder private func styled(_ content: Content) -> some View {
@@ -70,6 +79,13 @@ private struct TableAppearance: ViewModifier {
 
 extension View {
   func tableAppearance() -> some View { modifier(TableAppearance()) }
+
+  func bottomBar(@ViewBuilder _ content: () -> some View) -> some View {
+    safeAreaBar(edge: .bottom, spacing: 0) {
+      content().padding()
+    }
+    .scrollEdgeEffectStyle(.hard, for: .bottom)
+  }
 }
 
 struct TableViewOptions: View {

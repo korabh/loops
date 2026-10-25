@@ -15,7 +15,6 @@ struct Job: Identifiable, Equatable {
   var tasksDone: Int
   var tasksTotal: Int
   var current: String?
-  var activity: [String]
   var plan: [PlanStep] = []
   var updated: Date
   var transcript: String? = nil
@@ -23,18 +22,70 @@ struct Job: Identifiable, Equatable {
 }
 
 @MainActor @Observable
+final class JobSteps {
+  private(set) var list: [String] = []
+  private(set) var total = 0
+
+  func add(_ steps: [String], reset: Bool) {
+    let next = Array(((reset ? [] : list) + steps).suffix(8))
+    if next != list { list = next }
+    if !steps.isEmpty { total += steps.count }
+  }
+}
+
+@MainActor
+enum JobActivity {
+  private static var byId: [String: JobSteps] = [:]
+
+  static func of(_ id: String) -> JobSteps {
+    if let hit = byId[id] { return hit }
+    let made = JobSteps()
+    byId[id] = made
+    return made
+  }
+
+  static func drop(_ ids: some Sequence<String>) {
+    for id in ids { byId[id] = nil }
+  }
+}
+
+extension Job {
+  @MainActor var activity: [String] { JobActivity.of(id).list }
+}
+
+extension BgTask {
+  @MainActor var recent: [String] { JobActivity.of(id).list }
+}
+
+@MainActor @Observable
 final class JobWatcher {
   private(set) var jobs: [String: Job] = [:]
-  @ObservationIgnored private let source: JobSource
+  @ObservationIgnored private var source: JobSource
   @ObservationIgnored private var stream: FSEventStreamRef?
   @ObservationIgnored private var watched: [String] = []
-  @ObservationIgnored private var followed: String?
+  @ObservationIgnored private var follows: [String: Int] = [:]
   @ObservationIgnored private var hooked: Set<String> = []
+  @ObservationIgnored private let syncing = Flight()
 
   init(configs: [String]) {
-    var seen = Set<String>()
-    source = JobSource(configs: configs.map(JobSource.standard).filter { seen.insert($0).inserted })
+    source = JobSource(configs: JobSource.unique(configs))
     source.watcher = self
+  }
+
+  func watch(_ configs: [String]) {
+    let wanted = JobSource.unique(configs).sorted()
+    guard wanted != source.configs else { return }
+    close()
+    let old = source
+    old.watcher = nil
+    old.queue.async { old.unfollowAll() }
+    source = JobSource(configs: wanted)
+    source.watcher = self
+    let source = self.source
+    let ids = Array(follows.keys)
+    source.queue.async { for id in ids { source.follow(id, true) } }
+    start()
+    Task { await reconcile() }
   }
 
   func start() {
@@ -46,19 +97,41 @@ final class JobWatcher {
 
   func stop() {
     close()
-    followed = nil
+    follows = [:]
     let source = self.source
-    source.queue.async { source.follow(nil) }
+    source.queue.async { source.unfollowAll() }
   }
 
-  func follow(_ id: String?) {
-    guard id != followed else { return }
-    followed = id
+  func follow(_ id: String) {
+    follows[id, default: 0] += 1
+    guard follows[id] == 1 else { return }
     let source = self.source
-    source.queue.async { source.follow(id) }
+    source.queue.async { source.follow(id, true) }
   }
 
-  func reconcile() async {
+  func unfollow(_ id: String) {
+    guard let n = follows[id] else { return }
+    guard n <= 1 else {
+      follows[id] = n - 1
+      return
+    }
+    follows[id] = nil
+    let source = self.source
+    source.queue.async { source.follow(id, false) }
+  }
+
+  func following(_ id: String) async {
+    follow(id)
+    while !Task.isCancelled { try? await Task.sleep(for: .seconds(3600)) }
+    unfollow(id)
+  }
+
+  func reconcile(every: Double = 0) async {
+    await syncing.run(within: every) { await self.sync() }
+  }
+
+  private func sync() async {
+    let source = self.source
     for config in source.configs {
       guard let data = await JobSource.output(["claude", "agents", "--json", "--all"], config: config),
         let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]]
@@ -78,44 +151,43 @@ final class JobWatcher {
             ?? Job(
               id: id, name: entry["name"] as? String ?? id, state: state ?? "unknown", waitingFor: nil, detail: nil,
               result: nil, sessionId: entry["sessionId"] as? String, cwd: entry["cwd"] as? String, worktreeBranch: nil,
-              tasksDone: 0, tasksTotal: 0, current: nil, activity: [],
+              tasksDone: 0, tasksTotal: 0, current: nil,
               updated: (entry["startedAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) } ?? Date())
           if let state { job.state = state }
           job.waitingFor = entry["waitingFor"] as? String
-          jobs[id] = job
+          if job != jobs[id] { jobs[id] = job }
         }
       }
     }
-    if source.watchPaths() != watched {
+    if source === self.source, source.watchPaths() != watched {
       close()
       open()
     }
   }
 
-  fileprivate func apply(_ changed: [Job], removed: [String], all: Bool) {
+  fileprivate func apply(_ changed: [Job], removed: [String], all: Bool, from: JobSource) {
+    guard from === source else { return }
     var next = all ? [:] : jobs
     for id in removed { next[id] = nil }
     for var job in changed {
-      if let old = jobs[job.id] {
-        job.activity = old.activity
-        if job.waitingFor == nil, job.state == "blocked", old.state == "blocked" { job.waitingFor = old.waitingFor }
-      }
+      if let old = jobs[job.id], job.waitingFor == nil, job.state == "blocked", old.state == "blocked" { job.waitingFor = old.waitingFor }
       next[job.id] = job
     }
-    if next != jobs { jobs = next }
+    if next != jobs {
+      JobActivity.drop(jobs.keys.filter { next[$0] == nil })
+      jobs = next
+    }
   }
 
   func record(_ tool: String, _ input: [String: Any], for id: String) {
-    hooked.insert(id)
-    guard var job = jobs[id], let step = JobTail.step(tool, input) else { return }
-    job.activity = Array((job.activity + [String(step.prefix(90))]).suffix(8))
-    jobs[id] = job
+    if !hooked.contains(id) { hooked.insert(id) }
+    guard jobs[id] != nil, let step = JobTail.step(tool, input) else { return }
+    JobActivity.of(id).add([String(step.prefix(90))], reset: false)
   }
 
   fileprivate func steps(_ steps: [String], for id: String, reset: Bool) {
-    guard var job = jobs[id], reset || !hooked.contains(id) else { return }
-    job.activity = Array(((reset ? [] : job.activity) + steps).suffix(8))
-    if job != jobs[id] { jobs[id] = job }
+    guard jobs[id] != nil, reset || !hooked.contains(id) else { return }
+    JobActivity.of(id).add(steps, reset: reset)
   }
 
   private func open() {
@@ -160,10 +232,15 @@ private final class JobSource: @unchecked Sendable {
   private var homes: [String: String] = [:]
   private var sessions: [String: String] = [:]
   private var transcripts: [String: String] = [:]
-  private var followed: String?
-  private var tail: JobTail?
+  private var followed = Set<String>()
+  private var tails: [String: JobTail] = [:]
 
   init(configs: [String]) { self.configs = configs }
+
+  static func unique(_ configs: [String]) -> [String] {
+    var seen = Set<String>()
+    return configs.map(standard).filter { seen.insert($0).inserted }
+  }
 
   static func standard(_ path: String) -> String {
     let expanded = (path as NSString).expandingTildeInPath
@@ -218,15 +295,25 @@ private final class JobSource: @unchecked Sendable {
     }
   }
 
-  func follow(_ id: String?) {
-    followed = id
-    tail?.cancel()
-    tail = nil
-    guard let id, let path = transcripts[id] else { return }
-    tail = JobTail(path: path, queue: queue) { [weak self] steps, reset in
+  func follow(_ id: String, _ on: Bool) {
+    tails[id]?.cancel()
+    tails[id] = nil
+    guard on else {
+      followed.remove(id)
+      return
+    }
+    followed.insert(id)
+    guard let path = transcripts[id] else { return }
+    tails[id] = JobTail(path: path, queue: queue) { [weak self] steps, reset in
       guard let watcher = self?.watcher else { return }
       DispatchQueue.main.async { MainActor.assumeIsolated { watcher.steps(steps, for: id, reset: reset) } }
     }
+  }
+
+  func unfollowAll() {
+    for tail in tails.values { tail.cancel() }
+    tails = [:]
+    followed = []
   }
 
   private enum Read {
@@ -250,7 +337,7 @@ private final class JobSource: @unchecked Sendable {
       waitingFor: s["waitingFor"] as? String, detail: s["detail"] as? String,
       result: (output as? [String: Any])?["result"] as? String ?? output as? String, sessionId: session,
       cwd: s["cwd"] as? String, worktreeBranch: s["worktreeBranch"] as? String, tasksDone: 0, tasksTotal: 0,
-      current: nil, activity: [],
+      current: nil,
       updated: ((try? FileManager.default.attributesOfItem(atPath: file))?[.modificationDate] as? Date) ?? Date())
     job.prs = (s["children"] as? [[String: Any]] ?? []).filter { $0["kind"] as? String == "pr" }.compactMap { $0["href"] as? String }
     homes[id] = config
@@ -268,9 +355,9 @@ private final class JobSource: @unchecked Sendable {
       job.transcript = path
       if let path, transcripts[id] != path {
         transcripts[id] = path
-        if followed == id { follow(id) }
-      } else if followed == id, tail == nil {
-        follow(id)
+        if followed.contains(id) { follow(id, true) }
+      } else if followed.contains(id), tails[id] == nil {
+        follow(id, true)
       }
     }
     return .job(job)
@@ -294,34 +381,16 @@ private final class JobSource: @unchecked Sendable {
 
   private func post(_ changed: [Job], removed: [String], all: Bool) {
     guard let watcher else { return }
-    DispatchQueue.main.async { MainActor.assumeIsolated { watcher.apply(changed, removed: removed, all: all) } }
+    DispatchQueue.main.async { MainActor.assumeIsolated { watcher.apply(changed, removed: removed, all: all, from: self) } }
   }
 
   static func output(_ command: [String], config: String) async -> Data? {
-    await withCheckedContinuation { cont in
-      DispatchQueue.global(qos: .utility).async {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = command
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: "CLAUDE_CONFIG_DIR")
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        if config != standard("\(home)/.claude") { env["CLAUDE_CONFIG_DIR"] = config }
-        env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        p.environment = env
-        let pipe = Pipe()
-        p.standardInput = FileHandle.nullDevice
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch {
-          cont.resume(returning: nil)
-          return
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        cont.resume(returning: p.terminationStatus == 0 ? data : nil)
-      }
-    }
+    var env = ProcessInfo.processInfo.environment
+    env.removeValue(forKey: "CLAUDE_CONFIG_DIR")
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    if config != standard("\(home)/.claude") { env["CLAUDE_CONFIG_DIR"] = config }
+    let (code, data) = await Shell.spawn(command, in: nil, env: env, errors: false, qos: .utility)
+    return code == 0 ? data : nil
   }
 }
 

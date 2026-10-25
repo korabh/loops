@@ -55,7 +55,7 @@ enum GoalLog {
       else { continue }
       seen = next(seen ?? goal, status)
     }
-    cache[url.path] = (offset + UInt64(data.distance(from: data.startIndex, to: end) + 1), seen)
+    cache[url.path] = seen?.resolved == true ? nil : (offset + UInt64(data.distance(from: data.startIndex, to: end) + 1), seen)
     return seen ?? goal
   }
 

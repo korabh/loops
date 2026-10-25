@@ -43,46 +43,159 @@ enum Phase: Equatable {
 enum Standing { case running, due, resting, outside, off }
 
 enum Shell {
-  static func run(_ script: URL, _ args: [String], in repo: URL) async -> (Int32, String) {
-    await exec(["bash", script.path] + args, in: repo)
+  static func run(_ script: URL, _ args: [String], in repo: URL, qos: QualityOfService = .userInitiated) async -> (Int32, String) {
+    await exec(["bash", script.path] + args, in: repo, qos: qos)
   }
 
-  static func exec(_ command: [String], in dir: URL, config: String? = nil) async -> (Int32, String) {
-    await withCheckedContinuation { cont in
-      DispatchQueue.global(qos: .userInitiated).async {
-        let fm = FileManager.default
-        let log = fm.temporaryDirectory.appending(path: "loops-\(UUID().uuidString).log")
-        fm.createFile(atPath: log.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: log) else {
-          cont.resume(returning: (-1, "Could not open a log file in \(fm.temporaryDirectory.path)"))
-          return
-        }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = command
-        p.currentDirectoryURL = dir
-        var env = ProcessInfo.processInfo.environment
-        env.removeValue(forKey: "CLAUDE_CONFIG_DIR")
-        let home = fm.homeDirectoryForCurrentUser.path
-        if let config, config != "\(home)/.claude" { env["CLAUDE_CONFIG_DIR"] = config }
-        env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        p.environment = env
-        p.standardInput = FileHandle.nullDevice
-        p.standardOutput = handle
-        p.standardError = handle
-        do {
-          try p.run()
-        } catch {
-          cont.resume(returning: (-1, error.localizedDescription))
-          return
-        }
-        p.waitUntilExit()
-        try? handle.close()
-        let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
-        try? fm.removeItem(at: log)
-        cont.resume(returning: (p.terminationStatus, text))
+  static func exec(_ command: [String], in dir: URL, config: String? = nil, qos: QualityOfService = .userInitiated) async -> (
+    Int32, String
+  ) {
+    var env = ProcessInfo.processInfo.environment
+    env.removeValue(forKey: "CLAUDE_CONFIG_DIR")
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    if let config, config != "\(home)/.claude" { env["CLAUDE_CONFIG_DIR"] = config }
+    let (code, out) = await spawn(command, in: dir, env: env, errors: true, qos: qos)
+    return (code, String(decoding: out, as: UTF8.self))
+  }
+
+  static func spawn(_ command: [String], in dir: URL?, env: [String: String], errors: Bool, qos: QualityOfService) async -> (
+    Int32, Data
+  ) {
+    var env = env
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    p.arguments = command
+    if let dir { p.currentDirectoryURL = dir }
+    p.environment = env
+    p.qualityOfService = qos
+    let pipe = Pipe()
+    p.standardInput = FileHandle.nullDevice
+    p.standardOutput = pipe
+    p.standardError = errors ? pipe : FileHandle.nullDevice
+    return await withCheckedContinuation { cont in
+      let sink = Sink { cont.resume(returning: $0) }
+      sink.held = p
+      pipe.fileHandleForReading.readabilityHandler = { h in
+        let data = h.availableData
+        guard data.isEmpty else { return sink.append(data) }
+        h.readabilityHandler = nil
+        _ = pipe
+        sink.ended()
+      }
+      p.terminationHandler = { p in
+        sink.exited(p.terminationStatus)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { sink.ended() }
+      }
+      do {
+        try p.run()
+      } catch {
+        pipe.fileHandleForReading.readabilityHandler = nil
+        sink.failed(error.localizedDescription)
       }
     }
+  }
+
+  private final class Sink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private var status: Int32?
+    private var closed = false
+    private var finish: (((Int32, Data)) -> Void)?
+    var held: AnyObject?
+
+    init(_ finish: @escaping ((Int32, Data)) -> Void) { self.finish = finish }
+
+    func append(_ chunk: Data) {
+      lock.withLock { if finish != nil { data.append(chunk) } }
+    }
+
+    func exited(_ code: Int32) { settle { status = code } }
+
+    func ended() { settle { closed = true } }
+
+    func failed(_ why: String) {
+      settle {
+        data = Data(why.utf8)
+        status = -1
+        closed = true
+      }
+    }
+
+    private func settle(_ change: () -> Void) {
+      lock.lock()
+      change()
+      guard closed, let status, let done = finish else { return lock.unlock() }
+      finish = nil
+      held = nil
+      let out = data
+      data = Data()
+      lock.unlock()
+      done((status, out))
+    }
+  }
+}
+
+@MainActor
+final class Flight {
+  private var current: Task<Void, Never>?
+  private var again = false
+  private(set) var at = Date.distantPast
+
+  var busy: Bool { current != nil }
+
+  func run(within: Double = 0, _ work: @escaping @MainActor () async -> Void) async {
+    if let current {
+      if within <= 0 { again = true }
+      return await current.value
+    }
+    guard within <= 0 || Date().timeIntervalSince(at) >= within else { return }
+    let task = Task { @MainActor in
+      repeat {
+        again = false
+        await work()
+        at = Date()
+      } while again
+      current = nil
+    }
+    current = task
+    await task.value
+  }
+}
+
+@MainActor
+final class Saver {
+  private let delay: Duration
+  private let write: (Data) -> Void
+  private var last: Data?
+  private var make: (() -> Data?)?
+  private var timer: Task<Void, Never>?
+
+  init(delay: Duration = .seconds(2), last: Data? = nil, write: @escaping (Data) -> Void) {
+    self.delay = delay
+    self.last = last
+    self.write = write
+  }
+
+  func save(_ make: @escaping () -> Data?) {
+    self.make = make
+    guard timer == nil else { return }
+    timer = Task { [weak self, delay] in
+      try? await Task.sleep(for: delay)
+      guard !Task.isCancelled else { return }
+      self?.flush()
+    }
+  }
+
+  func flush() {
+    timer?.cancel()
+    timer = nil
+    guard let make else { return }
+    self.make = nil
+    guard let data = make(), data != last else { return }
+    last = data
+    write(data)
   }
 }
 
@@ -141,9 +254,26 @@ final class Store {
   @ObservationIgnored private var liveSoon: Task<Void, Never>?
   @ObservationIgnored private var spendSoon: Task<Void, Never>?
   @ObservationIgnored var hooked: Set<String> = []
-  @ObservationIgnored private var activated = Date.distantPast
-  @ObservationIgnored var showWindow: (() -> Void)?
+  @ObservationIgnored var heard = Date.distantPast
   @ObservationIgnored var announced: Set<Int>?
+  @ObservationIgnored private var loops: [Task<Void, Never>] = []
+  @ObservationIgnored private var observers: [NSObjectProtocol] = []
+  @ObservationIgnored private var ran: [Feed: Date] = [:]
+  @ObservationIgnored private var stopped = false
+  @ObservationIgnored private let owned: Bool
+  @ObservationIgnored private let probes = NSHashTable<VisibilityProbe>.weakObjects()
+  @ObservationIgnored private var inboxGeneration = 0
+  @ObservationIgnored var derivation = 0
+  @ObservationIgnored var checked: Set<String> = []
+  @ObservationIgnored var numbers: [String: (links: [String], answer: String?, found: [Int])] = [:]
+  @ObservationIgnored private var hasScript: Bool?
+  @ObservationIgnored let saver: Saver
+  @ObservationIgnored let runnerFlight = Flight()
+  @ObservationIgnored let githubFlight = Flight()
+  @ObservationIgnored let liveFlight = Flight()
+  @ObservationIgnored let spendFlight = Flight()
+  @ObservationIgnored let inputFlight = Flight()
+  @ObservationIgnored private let allFlight = Flight()
 
   var open: Set<Int>?
   var githubLoaded = false
@@ -167,8 +297,11 @@ final class Store {
   var composing = false
   var appearance: Appearance
   private(set) var dismissed: Set<String>
+  private(set) var inbox: [InboxRow] = []
+  var inputs: [String: PendingInput] = [:]
+  var reviewed: [String: String] = [:]
 
-  init(repo: URL, defaults: UserDefaults) {
+  init(repo: URL, defaults: UserDefaults, jobs shared: JobWatcher? = nil) {
     paths = Paths(repo: repo)
     self.defaults = defaults
     planner = Planner(defaults: defaults)
@@ -178,48 +311,111 @@ final class Store {
     queued = defaults.dictionary(forKey: "queuedFollowUps") as? [String: String] ?? [:]
     dismissed = Set(defaults.stringArray(forKey: "dismissed") ?? [])
     appearance = Appearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system
-    let legacy = (Reader.text(repo.appending(path: ".git/loop-accounts")) ?? "").split(separator: "\n").map(String.init)
-    configs = Array(Set((legacy + (Registry.read()?.accounts ?? [])).map { ($0 as NSString).expandingTildeInPath })).sorted()
-    jobs = JobWatcher(configs: configs)
-    jobs.start()
+    saver = Saver(last: defaults.data(forKey: "tasks")) { [defaults] in defaults.set($0, forKey: "tasks") }
+    configs = Store.accounts(repo)
+    owned = shared == nil
+    jobs = shared ?? JobWatcher(configs: configs)
     loadTasks()
     loadModelPRs()
-    Task { await jobs.reconcile() }
-    NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) {
-      [weak self] _ in
-      Task { @MainActor in
-        guard let self else { return }
-        await self.jobs.reconcile()
-        guard Date().timeIntervalSince(self.activated) > 20 else { return }
-        self.activated = Date()
-        await self.refreshGitHub()
-      }
+    if owned {
+      jobs.start()
+      Task { await jobs.reconcile() }
     }
-    DispatchQueue.main.async { [appearance] in
+    let center = NotificationCenter.default
+    observers.append(
+      center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+        MainActor.assumeIsolated { self?.activate() }
+      })
+    observers.append(
+      center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+        MainActor.assumeIsolated { self?.saver.flush() }
+      })
+    DispatchQueue.main.async { [weak self, appearance] in
       NSApp.appearance = appearance.nsAppearance
-      self.trackBadge()
+      self?.trackBadge()
     }
-    reload()
-    Task { await poll() }
+    followJobs()
+    rebuildInbox()
+    ran[.spend] = Date().addingTimeInterval(30 - interval(.spend))
+    loops.append(
+      Task { [weak self] in
+        while !Task.isCancelled {
+          guard self?.check() != nil else { return }
+          try? await Task.sleep(for: .seconds(5))
+        }
+      })
   }
 
-  private func poll() async {
-    followJobs()
-    var n = 0
-    while !Task.isCancelled {
+  static func accounts(_ repo: URL) -> [String] {
+    let legacy = (Reader.text(repo.appending(path: ".git/loop-accounts")) ?? "").split(separator: "\n").map(String.init)
+    return Array(Set((legacy + (Registry.read()?.accounts ?? [])).map { ($0 as NSString).expandingTildeInPath })).sorted()
+  }
+
+  func stop() {
+    guard !stopped else { return }
+    stopped = true
+    loops.forEach { $0.cancel() }
+    loops = []
+    liveSoon?.cancel()
+    spendSoon?.cancel()
+    observers.forEach(NotificationCenter.default.removeObserver)
+    observers = []
+    watch?.stop()
+    watch = nil
+    if owned { jobs.stop() }
+    saver.flush()
+  }
+
+  enum Feed: CaseIterable { case tick, runner, live, spend, github, ci }
+
+  var visible: Bool { probes.allObjects.contains(where: \.shown) }
+
+  func track(_ probe: VisibilityProbe) {
+    if !probes.contains(probe) { probes.add(probe) }
+  }
+
+  func sighted() { check() }
+
+  private var hooksLive: Bool { Date().timeIntervalSince(heard) < 2 * 3600 }
+
+  func interval(_ feed: Feed) -> Double {
+    switch feed {
+    case .tick, .live: 60
+    case .runner: hooksLive ? 300 : 60
+    case .spend: visible ? 60 : 600
+    case .github: visible ? 300 : 600
+    case .ci: visible ? 60 : 300
+    }
+  }
+
+  private func check() {
+    guard !stopped else { return }
+    let now = Date()
+    for feed in Feed.allCases where now.timeIntervalSince(ran[feed] ?? .distantPast) >= interval(feed) {
+      ran[feed] = now
+      Task { await run(feed) }
+    }
+  }
+
+  private func run(_ feed: Feed) async {
+    switch feed {
+    case .tick:
       clock(Date())
       startWatching()
-      if n > 0 { reload() }
-      await refreshRunner()
-      if n % 5 == 0 { await refreshGitHub() }
-      await refreshLive()
+      reload()
       refreshTasks()
-      await refreshSpend()
-      await ci.refreshIfStale(store: self)
       planner.wake(store: self)
-      n += 1
-      try? await Task.sleep(for: .seconds(60))
+    case .runner: await refreshRunner(within: 1)
+    case .live: await refreshLive(within: 1)
+    case .spend: await refreshSpend(within: 1)
+    case .github: await refreshGitHub(within: 1)
+    case .ci: await ci.refreshIfStale(store: self, after: interval(.ci) - 15)
     }
+  }
+
+  private func activate() {
+    guard !stopped, visible else { return }
+    Task { await refreshGitHub(within: 20) }
   }
 
   private var runnerProjects: [String] { configs.map { "\($0)/projects/\(Spend.slug(paths.runner.path))" } }
@@ -242,20 +438,22 @@ final class Store {
   }
 
   func liveLater(_ delay: Double) {
-    guard liveSoon == nil else { return }
+    guard liveSoon == nil, !stopped else { return }
     liveSoon = Task { [weak self] in
       try? await Task.sleep(for: .seconds(delay))
-      await self?.refreshLive()
+      guard !Task.isCancelled else { return }
       self?.liveSoon = nil
+      await self?.refreshLive()
     }
   }
 
   func spendLater() {
-    guard spendSoon == nil else { return }
+    guard spendSoon == nil, !stopped, visible else { return }
     spendSoon = Task { [weak self] in
       try? await Task.sleep(for: .seconds(15))
-      await self?.refreshSpend()
+      guard !Task.isCancelled else { return }
       self?.spendSoon = nil
+      await self?.refreshSpend()
     }
   }
 
@@ -272,12 +470,12 @@ final class Store {
         inboxSelection = "pr-\(pr)"
         page = .inbox
       }
-      showWindow?()
-      NSApp.activate()
+      Workspace.current?.show(id)
     }
   }
 
   func announce() {
+    rebuildInbox()
     let ready = Set(inbox.filter { $0.kind == .merge }.compactMap(\.pr))
     defer { if !pulls.isEmpty { announced = ready } }
     guard let announced else { return }
@@ -299,6 +497,7 @@ final class Store {
   }
 
   private func followJobs() {
+    guard !stopped else { return }
     withObservationTracking {
       _ = jobs.jobs
     } onChange: { [weak self] in
@@ -309,23 +508,41 @@ final class Store {
     }
   }
 
+  func rebuildInbox() {
+    inboxGeneration += 1
+    let generation = inboxGeneration
+    let rows = withObservationTracking {
+      inboxRows()
+    } onChange: { [weak self] in
+      Task { @MainActor in
+        guard let self, !self.stopped, self.inboxGeneration == generation else { return }
+        self.rebuildInbox()
+      }
+    }
+    if rows != inbox { inbox = rows }
+  }
+
   private func clock(_ date: Date) {
     if Int(date.timeIntervalSince1970 / 60) != Int(now.timeIntervalSince1970 / 60) { now = date }
   }
 
   @discardableResult
-  private func update<T: Equatable>(_ key: ReferenceWritableKeyPath<Store, T>, _ value: T) -> Bool {
+  func update<T: Equatable>(_ key: ReferenceWritableKeyPath<Store, T>, _ value: T) -> Bool {
     guard self[keyPath: key] != value else { return false }
     self[keyPath: key] = value
     return true
   }
 
-  func refreshSpend() async {
+  func refreshSpend(within: Double = 0) async {
+    await spendFlight.run(within: within) { await self.loadSpend() }
+  }
+
+  private func loadSpend() async {
     let configs = configs
     let runner = paths.runner
     let tasks = tasks.compactMap { t in t.sessionId.flatMap { sid in t.cwd.map { (session: sid, cwd: $0) } } }
     let keyed = self.tasks.compactMap { t in t.sessionId.flatMap { sid in t.cwd.map { (id: t.stable, session: sid, cwd: $0) } } }
-    let (report, spent) = await Task.detached {
+    let (report, spent) = await Task.detached(priority: .utility) {
       let report = Spend.report(configs: configs, runner: runner, tasks: tasks, now: Date())
       var spent: [String: Tokens] = [:]
       for t in keyed {
@@ -379,17 +596,21 @@ final class Store {
       ))
   }
 
-  func refreshLive() async {
+  func refreshLive(within: Double = 0) async {
+    await liveFlight.run(within: within) { await self.loadLive() }
+  }
+
+  private func loadLive() async {
     let config = runner?.account ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".claude").path
     let runner = paths.runner
     let now = Date()
     let locked = Set(running.keys)
-    let next = await Task.detached { Live.read(config: config, runner: runner, running: locked, now: now) }.value
+    let next = await Task.detached(priority: .utility) { Live.read(config: config, runner: runner, running: locked, now: now) }.value
     let before = Set(live?.agents.filter { !$0.finished && !$0.stalled }.map(\.loop) ?? [])
     let after = Set(next?.agents.filter { !$0.finished && !$0.stalled }.map(\.loop) ?? [])
     if next != live { live = next }
     for loop in before.subtracting(after) where notifyAll || watched.contains(loop) {
-      watched.remove(loop)
+      if watched.contains(loop) { watched.remove(loop) }
       let brief = next?.agents(for: loop).first { $0.role == nil }?.brief
       let line = brief.map { Briefs.readable(Briefs.sentences(Briefs.body(Brief(id: 0, at: now, loop: loop, text: $0))).first ?? $0) }
       notify(title: "\(title(loop)) finished", body: line ?? "Its run is over. Open Loops for the brief.")
@@ -415,7 +636,9 @@ final class Store {
   }
 
   func toggleWatch(_ loop: String) {
-    if watched.remove(loop) == nil {
+    if watched.contains(loop) {
+      watched.remove(loop)
+    } else {
       watched.insert(loop)
       Task { await Notify.authorize() }
     }
@@ -439,7 +662,7 @@ final class Store {
     let known = descriptions
     let date = Date()
     Task {
-      let snap = await Task.detached { LoopSnapshot.read(paths: paths, descriptions: known, now: date) }.value
+      let snap = await Task.detached(priority: .utility) { LoopSnapshot.read(paths: paths, descriptions: known, now: date) }.value
       apply(snap, at: date)
       reloading = false
       if reloadAgain {
@@ -458,7 +681,9 @@ final class Store {
     }
     update(\.project, snap.project)
     update(\.models, snap.models)
-    update(\.states, snap.states)
+    if update(\.states, snap.states) {
+      update(\.reviewed, (snap.states["loop-pr-review"]?.raw["reviewed"] as? [String: String]) ?? [:])
+    }
     let newBriefs = update(\.briefs, snap.briefs)
     update(\.running, snap.running)
     update(\.paused, snap.paused)
@@ -467,17 +692,36 @@ final class Store {
     var latest: [String: Brief] = [:]
     for b in briefs where latest[b.loop].map({ b.at >= $0.at }) ?? true { latest[b.loop] = b }
     update(\.latest, latest)
-    let newAsks = update(\.asks, latest.values.sorted { $0.at > $1.at }.flatMap(Briefs.asks).filter { !dismissed.contains($0.id) && !settled($0) })
+    let newAsks = settle()
     update(\.nextTick, snap.nextTick)
     update(\.forecast, snap.forecast)
     update(\.nextRun, snap.nextRun)
     if newBriefs || newAsks || items.isEmpty { derive() }
   }
 
+  @discardableResult
+  func settle() -> Bool {
+    update(\.asks, latest.values.sorted { $0.at > $1.at }.flatMap(Briefs.asks).filter { !dismissed.contains($0.id) && !settled($0) })
+  }
+
   func refresh() async {
     reload()
-    await refreshRunner()
-    await refreshGitHub()
+    async let runner: Void = refreshRunner(within: 20)
+    async let github: Void = refreshGitHub(within: 20)
+    async let checks: Void = ci.refreshIfStale(store: self)
+    _ = await (runner, github, checks)
+  }
+
+  func refreshAll() async {
+    await allFlight.run {
+      self.reload()
+      async let runner: Void = self.refreshRunner()
+      async let github: Void = self.refreshGitHub()
+      async let checks: Void = self.ci.refresh(store: self)
+      async let spend: Void = self.refreshSpend()
+      async let live: Void = self.refreshLive()
+      _ = await (runner, github, checks, spend, live)
+    }
   }
 
   private func settled(_ ask: Ask) -> Bool {
@@ -487,20 +731,25 @@ final class Store {
   }
 
   private var script: URL? {
-    (Reader.text(paths.script) ?? "").contains("  state) state ;;") ? paths.script : nil
+    if hasScript == nil { hasScript = (Reader.text(paths.script) ?? "").contains("  state) state ;;") }
+    return hasScript == true ? paths.script : nil
   }
 
-  func refreshRunner() async {
+  func refreshRunner(within: Double = 0) async {
+    await runnerFlight.run(within: within) { await self.loadRunner() }
+  }
+
+  private func loadRunner() async {
     guard let script else {
-      runner = nil
-      runnerProblem = "This build of Loops has no loop-runner, so the runner's status and account are unknown."
+      update(\.runner, nil)
+      update(\.runnerProblem, "This build of Loops has no loop-runner, so the runner's status and account are unknown.")
       return
     }
-    let (code, out) = await Shell.run(script, ["state"], in: paths.repo)
+    let (code, out) = await Shell.run(script, ["state"], in: paths.repo, qos: .utility)
     let json = out.split(separator: "\n").last.map(String.init) ?? ""
     if code == 0, let s = try? JSONDecoder().decode(RunnerState.self, from: Data(json.utf8)) {
-      runner = s
-      runnerProblem = nil
+      update(\.runner, s)
+      update(\.runnerProblem, nil)
       let runner = paths.runner
       let job = s.session?.id.flatMap { jobs.jobs[$0] }
       let stuck = s.session?.state == "blocked" ? job?.detail.flatMap { $0.localizedCaseInsensitiveContains("limit") ? $0 : nil } : nil
@@ -510,7 +759,7 @@ final class Store {
         : stuck.map { UsageLimit(text: $0, at: job?.updated, resets: UsageLimit.resets(in: $0, after: job?.updated ?? Date())) }
       if next != limit { noticeLimit(from: limit, to: next) }
     } else {
-      runnerProblem = out.isEmpty ? "loop-runner state exited with \(code)." : out
+      update(\.runnerProblem, out.isEmpty ? "loop-runner state exited with \(code)." : out)
     }
   }
 

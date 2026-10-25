@@ -12,7 +12,6 @@ struct BgTask: Identifiable, Codable, Equatable {
   var sessionId: String?
   var cwd: String?
   var steps: Int = 0
-  var recent: [String] = []
   var answer: String?
   var key: String?
   var goal: TaskGoal?
@@ -68,7 +67,7 @@ extension Store {
   }
 
   func saveTasks() {
-    if let data = try? JSONEncoder().encode(tasks) { defaults.set(data, forKey: "tasks") }
+    saver.save { [weak self] in self.flatMap { try? JSONEncoder().encode($0.tasks) } }
   }
 
   static func prompt(from url: URL?) -> String? {
@@ -97,7 +96,7 @@ extension Store {
   ) {
     let key = key ?? prompt
     let command = goal.flatMap { Goal.command(prompt, goal: $0) }
-    asking.insert(key)
+    if !asking.contains(key) { asking.insert(key) }
     notice = nil
     Task {
       let (code, out) = await Shell.exec(
@@ -133,7 +132,6 @@ extension Store {
       t.cwd = job.cwd ?? t.cwd
       t.answer = job.result ?? t.answer
       if !job.prs.isEmpty { t.prs = job.prs }
-      t.recent = job.activity
       t.goal = goalProgress(t)
       if job.state == "blocked", let detail = job.detail, UsageLimit.reached(detail) {
         t.limit = t.limit ?? UsageLimit(text: detail, at: Date(), resets: UsageLimit.resets(in: detail, after: Date()))
@@ -159,16 +157,22 @@ extension Store {
       }
     }
     if changed { saveTasks() }
+    if changed || !needsInput.isEmpty || !inputs.isEmpty { loadInputs() }
     resumeLimited()
     sendQueued()
   }
 
   func transcript(_ t: BgTask) -> URL? {
-    if let path = jobs.jobs[t.id]?.transcript, FileManager.default.fileExists(atPath: path) { return URL(fileURLWithPath: path) }
-    guard let sid = t.sessionId, let cwd = t.cwd else { return nil }
+    Store.transcript(path: jobs.jobs[t.id]?.transcript, session: t.sessionId, cwd: t.cwd, configs: configs)
+  }
+
+  nonisolated static func transcript(path: String?, session: String?, cwd: String?, configs: [String]) -> URL? {
+    let fm = FileManager.default
+    if let path, fm.fileExists(atPath: path) { return URL(fileURLWithPath: path) }
+    guard let session, let cwd else { return nil }
     return configs.lazy
-      .map { URL(fileURLWithPath: $0).appending(path: "projects/\(Spend.slug(cwd))/\(sid).jsonl") }
-      .first { FileManager.default.fileExists(atPath: $0.path) }
+      .map { URL(fileURLWithPath: $0).appending(path: "projects/\(Spend.slug(cwd))/\(session).jsonl") }
+      .first { fm.fileExists(atPath: $0.path) }
   }
 
   func stopTask(_ t: BgTask) {
@@ -184,6 +188,7 @@ extension Store {
       let (code, out) = await Shell.exec(["claude", "rm", t.id], in: paths.repo, config: config)
       if code != 0 { notice = out.trimmingCharacters(in: .whitespacesAndNewlines) }
       tasks.removeAll { $0.id == t.id }
+      numbers[t.id] = nil
       saveTasks()
     }
   }
@@ -229,8 +234,15 @@ extension Store {
 
   func pull(of t: BgTask) -> PullRequest? {
     let links = (jobs.jobs[t.id]?.prs ?? []) + (t.prs ?? [])
-    let numbers = links.reversed().compactMap { Reader.groups(#"/pull/(\d+)"#, in: $0).first } + Reader.groups(#"(?:/pull/|PR #)(\d+)"#, in: t.answer ?? "")
-    return numbers.lazy.compactMap { Int($0).flatMap { self.pulls[$0] } }.first { $0.createdAt.map { $0 > t.started.addingTimeInterval(-60) } ?? false }
+    let found: [Int]
+    if let hit = numbers[t.id], hit.links == links, hit.answer == t.answer {
+      found = hit.found
+    } else {
+      found = (links.reversed().compactMap { Reader.groups(#"/pull/(\d+)"#, in: $0).first }
+        + Reader.groups(#"(?:/pull/|PR #)(\d+)"#, in: t.answer ?? "")).compactMap { Int($0) }
+      numbers[t.id] = (links, t.answer, found)
+    }
+    return found.lazy.compactMap { self.pulls[$0] }.first { $0.createdAt.map { $0 > t.started.addingTimeInterval(-60) } ?? false }
   }
 
 }

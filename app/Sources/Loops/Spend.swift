@@ -191,7 +191,12 @@ struct SpendReport: Equatable {
 }
 
 private final class Transcript {
+  let lock = NSLock()
+  var used = Date()
   var offset = 0
+  var quiet = false
+  var headed = false
+  var loop: String?
   var usage: [String: (Tokens, String)] = [:]
   var order: [String] = []
   var tools: [String: String] = [:]
@@ -206,6 +211,41 @@ private final class Transcript {
   var stat = AgentStat()
 
   private static let needles = ["\"type\":\"assistant\"", "\"tool_result\"", "\"cost-state\""].map { Data($0.utf8) }
+
+  func reset() {
+    offset = 0
+    quiet = false
+    usage = [:]
+    order = []
+    tools = [:]
+    results = []
+    first = nil
+    last = nil
+    model = ""
+    acted = false
+    limited = false
+    billed = nil
+    process = nil
+    stat = AgentStat()
+  }
+
+  func collapse() {
+    usage = [:]
+    order = []
+    tools = [:]
+    results = []
+    quiet = true
+  }
+
+  func consume(_ url: URL) {
+    guard let h = try? FileHandle(forReadingFrom: url) else { return }
+    defer { try? h.close() }
+    try? h.seek(toOffset: UInt64(offset))
+    let used = Spend.chunks(h) { feed($0) }
+    guard used > 0 else { return }
+    offset += used
+    stat = summarize()
+  }
 
   func feed(_ data: Data) {
     for line in data.split(separator: UInt8(ascii: "\n")) where Self.needles.contains(where: { line.range(of: $0) != nil }) {
@@ -241,11 +281,13 @@ private final class Transcript {
         }
       case "user":
         for item in (message["content"] as? [[String: Any]]) ?? [] where item["type"] as? String == "tool_result" {
+          let use = item["tool_use_id"] as? String ?? ""
           let chars = Self.length(item["content"])
           if chars >= Spend.big {
-            let what = tools[item["tool_use_id"] as? String ?? ""] ?? "a tool"
+            let what = tools[use] ?? "a tool"
             results.append((what.replacingOccurrences(of: "Read:", with: ""), chars, order.count, what.hasPrefix("Read:")))
           }
+          tools[use] = nil
         }
       default:
         continue
@@ -288,7 +330,33 @@ private final class Transcript {
 }
 
 enum Spend {
+  struct File {
+    let url: URL
+    let size: Int
+    let modified: Date
+    let directory: Bool
+
+    var name: String { url.lastPathComponent }
+    var stat: (size: Int, modified: Date) { (size, modified) }
+  }
+
+  private struct Journal {
+    var order: [(id: String, label: String)] = []
+    var done = Set<String>()
+    var briefs: [String: String] = [:]
+    var failed = Set<String>()
+  }
+
+  private struct Sample {
+    var process: Int?
+    var billed: Double?
+    var mine = 0.0
+  }
+
   nonisolated(unsafe) private static var cache: [String: Transcript] = [:]
+  nonisolated(unsafe) private static var journals: [String: (size: Int, modified: Date, journal: Journal, used: Date)] = [:]
+  nonisolated(unsafe) private static var metas: [String: (modified: Date, parent: String?, loop: String?, used: Date)] = [:]
+  nonisolated(unsafe) private static var samples: [String: (size: Int, modified: Date, sample: Sample, used: Date)] = [:]
   private static let lock = NSLock()
   static let big = 4_000
   private static let dayFormat: DateFormatter = {
@@ -303,22 +371,81 @@ enum Spend {
     path.replacingOccurrences(of: "[^A-Za-z0-9-]", with: "-", options: .regularExpression)
   }
 
-  static func agent(_ url: URL) -> AgentStat {
-    let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int) ?? 0
-    guard size > 0 else { return AgentStat() }
-    lock.lock()
-    defer { lock.unlock() }
-    let t = cache[url.path].flatMap { $0.offset <= size ? $0 : nil } ?? Transcript()
-    cache[url.path] = t
-    guard t.offset < size, let h = try? FileHandle(forReadingFrom: url) else { return t.stat }
-    defer { try? h.close() }
-    try? h.seek(toOffset: UInt64(t.offset))
-    guard let data = try? h.readToEnd(), let end = data.lastIndex(of: UInt8(ascii: "\n")) else { return t.stat }
-    let chunk = data[data.startIndex...end]
-    t.feed(chunk)
-    t.offset += chunk.count
-    t.stat = t.summarize()
+  static func chunks(_ h: FileHandle, _ feed: (Data) -> Void) -> Int {
+    var used = 0
+    var carry = Data()
+    while let chunk = try? h.read(upToCount: 4 << 20), !chunk.isEmpty {
+      carry.append(chunk)
+      guard let end = carry.lastIndex(of: 0x0A) else { continue }
+      feed(carry[carry.startIndex...end])
+      used += carry.distance(from: carry.startIndex, to: end) + 1
+      carry = Data(carry[carry.index(after: end)...])
+    }
+    return used
+  }
+
+  static func listing(_ dir: URL) -> [File] {
+    let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey]
+    let urls = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: Array(keys))) ?? []
+    return urls.map { url in
+      let v = try? url.resourceValues(forKeys: keys)
+      return File(url: url, size: v?.fileSize ?? 0, modified: v?.contentModificationDate ?? .distantPast, directory: v?.isDirectory ?? false)
+    }
+  }
+
+  static func stat(_ url: URL) -> (size: Int, modified: Date) {
+    let a = try? FileManager.default.attributesOfItem(atPath: url.path)
+    return ((a?[.size] as? Int) ?? 0, (a?[.modificationDate] as? Date) ?? .distantPast)
+  }
+
+  private static func entry(_ path: String) -> Transcript {
+    lock.withLock {
+      let t = cache[path] ?? Transcript()
+      cache[path] = t
+      t.used = Date()
+      return t
+    }
+  }
+
+  static func agent(_ url: URL, stat known: (size: Int, modified: Date)? = nil) -> AgentStat {
+    var info = known ?? stat(url)
+    guard info.size > 0 else { return AgentStat() }
+    let t = entry(url.path)
+    t.lock.lock()
+    defer { t.lock.unlock() }
+    if t.offset > info.size, known != nil { info = stat(url) }
+    if t.offset > info.size {
+      t.reset()
+      t.headed = false
+      t.loop = nil
+    } else if t.quiet, t.offset < info.size {
+      t.reset()
+    }
+    if t.offset < info.size { t.consume(url) }
+    if !t.quiet, t.offset == info.size, Date().timeIntervalSince(info.modified) > 30 * 60 { t.collapse() }
     return t.stat
+  }
+
+  static func loop(_ url: URL, size: Int) -> String? {
+    let t = entry(url.path)
+    t.lock.lock()
+    defer { t.lock.unlock() }
+    if t.headed { return t.loop }
+    let found = Reader.groups(#"<command-name>/(loop-[a-z-]+)</command-name>"#, in: head(url)).first
+    if found != nil || size >= 64 * 1024 {
+      t.headed = true
+      t.loop = found
+    }
+    return found
+  }
+
+  private static func sweep(_ now: Date) {
+    lock.withLock {
+      cache = cache.filter { now.timeIntervalSince($0.value.used) < 3600 }
+      journals = journals.filter { now.timeIntervalSince($0.value.used) < 3600 }
+      metas = metas.filter { now.timeIntervalSince($0.value.used) < 3600 }
+      samples = samples.filter { now.timeIntervalSince($0.value.used) < 3600 }
+    }
   }
 
   static func label(_ name: String, _ input: [String: Any]) -> String {
@@ -370,18 +497,10 @@ enum Spend {
     }
   }
 
-  private static func modified(_ url: URL) -> Date {
-    (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
-  }
-
   private static func head(_ url: URL) -> String {
     guard let h = try? FileHandle(forReadingFrom: url) else { return "" }
     defer { try? h.close() }
     return (try? h.read(upToCount: 64 * 1024)).map { String(decoding: $0, as: UTF8.self) } ?? ""
-  }
-
-  private static func files(_ dir: URL) -> [URL] {
-    (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
   }
 
   private enum Role { case main, judgment, reviewer, helper }
@@ -413,9 +532,20 @@ enum Spend {
     if let l = a.last, l > run.end { run.end = l }
   }
 
-  private static func meta(_ file: URL) -> [String: Any] {
+  private static func meta(_ file: URL, modified: Date) -> (parent: String?, loop: String?) {
     let url = file.deletingPathExtension().appendingPathExtension("meta.json")
-    return (try? Data(contentsOf: url)).flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+    let now = Date()
+    if let hit = lock.withLock({ () -> (parent: String?, loop: String?)? in
+      guard let hit = metas[url.path], hit.modified == modified else { return nil }
+      metas[url.path]?.used = now
+      return (hit.parent, hit.loop)
+    }) {
+      return hit
+    }
+    let m = (try? Data(contentsOf: url)).flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+    let found = (parent: m["parentAgentId"] as? String, loop: m["description"] as? String)
+    lock.withLock { metas[url.path] = (modified, found.parent, found.loop, now) }
+    return found
   }
 
   private static func id(_ file: URL) -> String {
@@ -435,29 +565,34 @@ enum Spend {
     }
     for config in configs {
       let projects = URL(fileURLWithPath: config).appending(path: "projects/\(slug(runner.path))")
-      let entries = files(projects)
+      let entries = listing(projects)
+      let touched = Dictionary(
+        entries.filter { $0.url.pathExtension == "jsonl" }.map { ($0.url.deletingPathExtension().lastPathComponent, $0.modified) },
+        uniquingKeysWith: { a, _ in a })
       var byHand: [String: Int] = [:]
-      for entry in entries where entry.pathExtension == "jsonl" && modified(entry) >= since {
-        let a = agent(entry)
-        guard let loop = Reader.groups(#"<command-name>/(loop-[a-z-]+)</command-name>"#, in: head(entry)).first else {
+      for entry in entries where entry.url.pathExtension == "jsonl" && entry.modified >= since {
+        let a = agent(entry.url, stat: entry.stat)
+        guard let loop = loop(entry.url, size: entry.size) else {
           r.runner += a.days[today] ?? Tokens()
           r.yesterday += a.days[yesterday] ?? Tokens()
           continue
         }
-        let session = entry.deletingPathExtension().lastPathComponent
-        var run = RunStat(id: session, loop: loop, at: a.first ?? modified(entry), end: a.last ?? modified(entry))
+        let session = entry.url.deletingPathExtension().lastPathComponent
+        var run = RunStat(id: session, loop: loop, at: a.first ?? entry.modified, end: a.last ?? entry.modified)
         run.byHand = true
-        run.finished = now.timeIntervalSince(modified(entry)) > 120
+        run.finished = now.timeIntervalSince(entry.modified) > 120
         byHand[session] = r.runs.count
         r.runs.append(run)
         add(a, to: r.runs.count - 1, as: .main)
       }
-      for entry in entries where entry.pathExtension.isEmpty {
+      for entry in entries where entry.url.pathExtension.isEmpty {
+        if let last = touched[entry.name], last < since.addingTimeInterval(-86400) { continue }
         var owner: [String: Int] = [:]
-        for flow in files(entry.appending(path: "subagents/workflows")) where flow.lastPathComponent.hasPrefix("wf_") {
-          let journal = flow.appending(path: "journal.jsonl")
-          guard modified(journal) >= since else { continue }
-          for (run, agents) in runs(flow, journal: journal, now: now) {
+        for flow in listing(entry.url.appending(path: "subagents/workflows")) where flow.name.hasPrefix("wf_") {
+          let journal = flow.url.appending(path: "journal.jsonl")
+          let stamp = stat(journal)
+          guard stamp.modified >= since else { continue }
+          for (run, agents) in runs(flow.url, journal: journal, stamp: stamp, now: now) {
             r.runs.append(run)
             let i = r.runs.count - 1
             for (id, role, a) in agents {
@@ -466,22 +601,23 @@ enum Spend {
             }
           }
         }
-        var pending: [(id: String, parent: String?, file: URL)] = []
-        for f in files(entry.appending(path: "subagents")) where f.pathExtension == "jsonl" && modified(f) >= since {
-          let m = meta(f)
-          let parent = m["parentAgentId"] as? String
-          if let i = byHand[entry.lastPathComponent], parent == nil {
-            owner[id(f)] = i
-            add(agent(f), to: i, as: .helper)
-          } else if parent == nil, let loop = m["description"] as? String, loop.hasPrefix("loop-"), !loop.contains(" ") {
-            let a = agent(f)
-            var run = RunStat(id: "\(entry.lastPathComponent):\(id(f))", loop: loop, at: a.first ?? modified(f), end: a.last ?? modified(f))
-            run.finished = now.timeIntervalSince(modified(f)) > 300
+        var pending: [(id: String, parent: String?, file: File)] = []
+        let subagents = listing(entry.url.appending(path: "subagents"))
+        let stamps = Dictionary(subagents.map { ($0.name, $0.modified) }, uniquingKeysWith: { a, _ in a })
+        for f in subagents where f.url.pathExtension == "jsonl" && f.modified >= since {
+          let m = meta(f.url, modified: stamps[f.url.deletingPathExtension().appendingPathExtension("meta.json").lastPathComponent] ?? .distantPast)
+          if let i = byHand[entry.name], m.parent == nil {
+            owner[id(f.url)] = i
+            add(agent(f.url, stat: f.stat), to: i, as: .helper)
+          } else if m.parent == nil, let loop = m.loop, loop.hasPrefix("loop-"), !loop.contains(" ") {
+            let a = agent(f.url, stat: f.stat)
+            var run = RunStat(id: "\(entry.name):\(id(f.url))", loop: loop, at: a.first ?? f.modified, end: a.last ?? f.modified)
+            run.finished = now.timeIntervalSince(f.modified) > 300
             r.runs.append(run)
-            owner[id(f)] = r.runs.count - 1
+            owner[id(f.url)] = r.runs.count - 1
             add(a, to: r.runs.count - 1, as: .main)
           } else {
-            pending.append((id(f), parent, f))
+            pending.append((id(f.url), m.parent, f))
           }
         }
         var progress = true
@@ -490,13 +626,13 @@ enum Spend {
           pending.removeAll { p in
             guard let parent = p.parent, let i = owner[parent] else { return false }
             owner[p.id] = i
-            add(agent(p.file), to: i, as: .helper)
+            add(agent(p.file.url, stat: p.file.stat), to: i, as: .helper)
             progress = true
             return true
           }
         }
         for p in pending {
-          let a = agent(p.file)
+          let a = agent(p.file.url, stat: p.file.stat)
           r.runner += a.days[today] ?? Tokens()
           r.yesterday += a.days[yesterday] ?? Tokens()
         }
@@ -506,7 +642,7 @@ enum Spend {
         let spent = a.days[today] ?? Tokens()
         r.tasks += a.billed.map { b in spent.scaled(a.tokens.cost > 0 ? b / a.tokens.cost : 1) } ?? spent
       }
-      checks += calibration(projects, since: now.addingTimeInterval(-30 * 86400), now: now)
+      checks += calibration(entries, since: now.addingTimeInterval(-30 * 86400), now: now)
     }
     if !checks.isEmpty {
       r.samples = checks.count
@@ -518,24 +654,20 @@ enum Spend {
     }
     r.today = r.todayLoops.values.reduce(r.runner + r.tasks, +)
     r.runs.sort { $0.at < $1.at }
+    sweep(now)
     return r
   }
 
-  private static func calibration(_ projects: URL, since: Date, now: Date) -> [(code: Double, mine: Double)] {
+  private static func calibration(_ entries: [File], since: Date, now: Date) -> [(code: Double, mine: Double)] {
     var byProcess: [Int: (code: Double, mine: Double, done: Bool)] = [:]
-    for entry in files(projects) where entry.pathExtension == "jsonl" && modified(entry) >= since {
-      let a = agent(entry)
-      guard let process = a.process, let billed = a.billed else { continue }
-      let dir = entry.deletingPathExtension()
-      var mine = a.tokens.cost
-      for f in files(dir.appending(path: "subagents")) where f.pathExtension == "jsonl" { mine += agent(f).tokens.cost }
-      for flow in files(dir.appending(path: "subagents/workflows")) {
-        for f in files(flow) where f.pathExtension == "jsonl" && f.lastPathComponent.hasPrefix("agent-") { mine += agent(f).tokens.cost }
-      }
+    for entry in entries where entry.url.pathExtension == "jsonl" && entry.modified >= since {
+      let done = now.timeIntervalSince(entry.modified) > 30 * 60
+      let sample = done ? cached(entry, now: now) ?? measured(entry, keep: true, now: now) : measured(entry, keep: false, now: now)
+      guard let process = sample.process, let billed = sample.billed else { continue }
       var e = byProcess[process] ?? (0, 0, true)
       e.code = max(e.code, billed)
-      e.mine += mine
-      e.done = e.done && now.timeIntervalSince(modified(entry)) > 30 * 60
+      e.mine += sample.mine
+      e.done = e.done && done
       byProcess[process] = e
     }
     return byProcess.values
@@ -543,25 +675,69 @@ enum Spend {
       .map { ($0.code, $0.mine) }
   }
 
-  private static func runs(_ flow: URL, journal: URL, now: Date) -> [(RunStat, [(String, Role, AgentStat)])] {
-    var order: [(id: String, label: String)] = []
-    var results: [String: Any] = [:]
-    var failed = Set<String>()
-    for line in (Reader.text(journal) ?? "").split(separator: "\n") {
+  private static func cached(_ entry: File, now: Date) -> Sample? {
+    lock.withLock {
+      guard let hit = samples[entry.url.path], hit.size == entry.size, hit.modified == entry.modified else { return nil }
+      samples[entry.url.path]?.used = now
+      return hit.sample
+    }
+  }
+
+  private static func measured(_ entry: File, keep: Bool, now: Date) -> Sample {
+    let a = agent(entry.url, stat: entry.stat)
+    var sample = Sample(process: a.process, billed: a.billed)
+    if a.process != nil, a.billed != nil {
+      let dir = entry.url.deletingPathExtension()
+      sample.mine = a.tokens.cost
+      for f in listing(dir.appending(path: "subagents")) where f.url.pathExtension == "jsonl" {
+        sample.mine += agent(f.url, stat: f.stat).tokens.cost
+      }
+      for flow in listing(dir.appending(path: "subagents/workflows")) {
+        for f in listing(flow.url) where f.url.pathExtension == "jsonl" && f.name.hasPrefix("agent-") {
+          sample.mine += agent(f.url, stat: f.stat).tokens.cost
+        }
+      }
+    }
+    if keep { lock.withLock { samples[entry.url.path] = (entry.size, entry.modified, sample, now) } }
+    return sample
+  }
+
+  private static func journal(_ url: URL, stamp: (size: Int, modified: Date)) -> Journal {
+    let now = Date()
+    if let hit = lock.withLock({ () -> Journal? in
+      guard let hit = journals[url.path], hit.size == stamp.size, hit.modified == stamp.modified else { return nil }
+      journals[url.path]?.used = now
+      return hit.journal
+    }) {
+      return hit
+    }
+    var j = Journal()
+    for line in (Reader.text(url) ?? "").split(separator: "\n") {
       guard let obj = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any],
         let id = obj["agentId"] as? String
       else { continue }
       switch obj["type"] as? String {
-      case "started": order.append((id, obj["label"] as? String ?? ""))
-      case "result": results[id] = obj["result"] ?? NSNull()
-      case "failed": failed.insert(id)
+      case "started": j.order.append((id, obj["label"] as? String ?? ""))
+      case "result":
+        j.done.insert(id)
+        let result = obj["result"]
+        if let brief = (result as? [String: Any])?["brief"] as? String ?? result as? String { j.briefs[id] = brief } else { j.briefs[id] = nil }
+      case "failed": j.failed.insert(id)
       default: break
       }
     }
+    lock.withLock { journals[url.path] = (stamp.size, stamp.modified, j, now) }
+    return j
+  }
+
+  private static func runs(_ flow: URL, journal url: URL, stamp: (size: Int, modified: Date), now: Date) -> [(
+    RunStat, [(String, Role, AgentStat)]
+  )] {
+    let j = journal(url, stamp: stamp)
+    let files = Dictionary(listing(flow).map { ($0.name, $0.stat) }, uniquingKeysWith: { a, _ in a })
     var out: [(RunStat, [(String, Role, AgentStat)])] = []
     var index: [String: Int] = [:]
-    let stamp = modified(journal)
-    for (id, label) in order {
+    for (id, label) in j.order {
       let parts = label.split(separator: ":").map(String.init)
       guard let loop = parts.first, loop.hasPrefix("loop-") else { continue }
       if index[loop] == nil {
@@ -569,27 +745,28 @@ enum Spend {
         out.append((RunStat(id: "\(flow.lastPathComponent):\(loop)", loop: loop, at: .distantFuture, end: .distantPast), []))
       }
       let i = index[loop]!
-      let a = agent(flow.appending(path: "agent-\(id).jsonl"))
+      let name = "agent-\(id).jsonl"
+      let a = agent(flow.appending(path: name), stat: files[name] ?? (0, .distantPast))
       let role: Role = parts.count == 1 ? .main : parts[1] == "judgment" ? .judgment : .reviewer
       out[i].1.append((id, role, a))
-      let result = results[id]
-      let brief = (result as? [String: Any])?["brief"] as? String ?? result as? String
+      let finished = j.done.contains(id)
+      let brief = j.briefs[id]
       switch role {
       case .main:
-        let stale = now.timeIntervalSince(a.last ?? stamp) > 30 * 60
-        out[i].0.failed = failed.contains(id) || (result == nil && stale)
-        out[i].0.finished = result != nil || out[i].0.failed
+        let stale = now.timeIntervalSince(a.last ?? stamp.modified) > 30 * 60
+        out[i].0.failed = j.failed.contains(id) || (!finished && stale)
+        out[i].0.finished = finished || out[i].0.failed
         out[i].0.brief = brief
       case .judgment:
-        if result == nil && !failed.contains(id) { out[i].0.finished = false }
+        if !finished && !j.failed.contains(id) { out[i].0.finished = false }
         if let brief { out[i].0.brief = brief }
       case .reviewer, .helper:
         break
       }
     }
     for i in out.indices where out[i].1.allSatisfy({ $0.2.first == nil }) {
-      out[i].0.at = stamp
-      out[i].0.end = stamp
+      out[i].0.at = stamp.modified
+      out[i].0.end = stamp.modified
     }
     return out
   }

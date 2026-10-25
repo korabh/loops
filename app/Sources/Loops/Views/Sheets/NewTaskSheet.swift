@@ -118,7 +118,7 @@ struct NewTaskSheet: View {
       }
       .formStyle(.grouped)
     }
-    .frame(width: 560, height: 640)
+    .presentationSizing(.form)
     .toolbar {
       ToolbarItem(placement: .cancellationAction) {
         Button("Cancel") { dismiss() }

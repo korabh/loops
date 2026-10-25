@@ -20,6 +20,18 @@ struct PullRow: Identifiable {
   }
 }
 
+enum PullToken: Identifiable, Hashable {
+  case stage(Stage)
+  case loop(String)
+
+  var id: String {
+    switch self {
+    case .stage(let s): "stage:\(s.rawValue)"
+    case .loop(let l): "loop:\(l)"
+    }
+  }
+}
+
 struct PullsPage: View {
   enum Filter: String, CaseIterable, Identifiable {
     case you, moving, done, all
@@ -40,12 +52,24 @@ struct PullsPage: View {
   @Environment(\.openURL) private var openURL
   @AppStorage("pullsFilter") private var filter = Filter.moving
   @AppStorage("pullsLoop") private var loop = ""
-  @AppStorage("planTab") private var planTab = PlanPage.Tab.propose
   @State private var stage: Stage?
   @State private var selection = Set<Int>()
   @State private var sortOrder = [KeyPathComparator(\PullRow.stageRank), KeyPathComparator(\PullRow.at, order: .reverse)]
   @SceneStorage("PullRowColumns") private var columns: TableColumnCustomization<PullRow>
   @State private var query = ""
+
+  private var tokens: Binding<[PullToken]> {
+    Binding(
+      get: { (loop.isEmpty ? [] : [.loop(loop)]) + (stage.map { [.stage($0)] } ?? []) },
+      set: { tokens in
+        loop = tokens.reversed().lazy.compactMap { if case .loop(let l) = $0 { l } else { nil } }.first ?? ""
+        stage = tokens.reversed().lazy.compactMap { if case .stage(let s) = $0 { s } else { nil } }.first
+      })
+  }
+
+  private var shown: Binding<Filter?> {
+    Binding(get: { stage == nil ? filter : nil }, set: { if let f = $0 { filter = f; stage = nil } })
+  }
 
   private func rows() -> [PullRow] {
     let pulls = store.outcomes.filter { $0.kind == .pull && (loop.isEmpty || $0.loop == loop) }
@@ -75,6 +99,7 @@ struct PullsPage: View {
   var body: some View {
     let rows = rows()
     let picked = rows.filter { selection.contains($0.id) }
+    let q = query.trimmingCharacters(in: .whitespaces)
     Table(of: PullRow.self, selection: $selection, sortOrder: $sortOrder, columnCustomization: $columns) {
       TableColumn("#", value: \PullRow.number) { r in
         Text(verbatim: "#\(r.number)").monospacedDigit().foregroundStyle(.secondary)
@@ -84,13 +109,16 @@ struct PullsPage: View {
       TableColumn("Title", value: \PullRow.title) { r in
         HStack(spacing: 6) {
           if r.outcome.pr?.oneWay == true {
-            Image(icon: "exclamationmark.octagon", size: 14).foregroundStyle(.red).help("One-way door: hard to undo once merged")
+            RowIcon(symbol: "exclamationmark.octagon").foregroundStyle(.red)
+              .help("One-way door: hard to undo once merged")
+              .accessibilityLabel("One-way door")
           }
           Text(r.title).help(r.outcome.note.map { "\(r.title)\n\($0)" } ?? r.title)
         }
       }
       .width(min: 200, ideal: 360)
       .customizationID("title")
+      .disabledCustomizationBehavior(.visibility)
       TableColumn("Loop", value: \PullRow.loop).width(min: 80, ideal: 120)
         .customizationID("loop")
       TableColumn("Stage", value: \PullRow.stageRank) { r in
@@ -131,40 +159,44 @@ struct PullsPage: View {
     .focusedSceneValue(\.selected, Selected(urls: picked.map(\.outcome.url), pulls: picked.compactMap(\.outcome.pr)))
     .overlay {
       if rows.isEmpty {
-        EmptyState(
-          title: store.githubLoaded ? (query.isEmpty ? "No Pull Requests" : "No Matches") : "Loading", icon: "arrow.triangle.pull")
-      }
-    }
-    .safeAreaInset(edge: .bottom, spacing: 0) {
-      VStack(spacing: 0) {
-        Divider()
-        PipelineBar(stage: $stage) {
-          planTab = .issues
-          store.page = .plan
+        if !store.githubLoaded {
+          EmptyState(loading: "Loading pull requests")
+        } else if !q.isEmpty {
+          ContentUnavailableView.search(text: q)
+        } else if stage != nil || !loop.isEmpty {
+          ContentUnavailableView.search
+        } else {
+          EmptyState(title: "No Pull Requests", icon: "arrow.triangle.pull")
         }
       }
-      .background(.bar)
     }
-    .navigationTitle("Pull Requests")
-    .navigationSubtitle(stats)
-    .searchable(text: $query, placement: .toolbar, prompt: "Filter")
+    .bottomBar {
+      PipelineBar(stage: $stage).help(stats)
+    }
+    .pageTitle("Pull Requests")
+    .searchable(text: $query, tokens: tokens, placement: .toolbar, prompt: Text("Filter")) { token in
+      switch token {
+      case .stage(let s): Text(s.title)
+      case .loop(let l): Text(store.title(l))
+      }
+    }
+    .searchSuggestions {
+      if loop.isEmpty {
+        ForEach(store.specs.filter { q.isEmpty || $0.title.localizedCaseInsensitiveContains(q) }) { spec in
+          Text(spec.title).searchCompletion(PullToken.loop(spec.name))
+        }
+      }
+    }
+    .viewTabs(shown, Filter.allCases.map(Optional.some)) { $0?.title ?? "" }
     .toolbar {
       ToolbarItem(placement: .principal) {
-        Picker("Show", selection: Binding(get: { filter }, set: { filter = $0; stage = nil })) {
-          ForEach(Filter.allCases) { Text($0.title).tag($0) }
+        Picker("Show", selection: shown) {
+          ForEach(Filter.allCases) { Text($0.title).tag(Optional($0)) }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
       }
-      ToolbarItem {
-        Picker("Loop", selection: $loop) {
-          Text("All Loops").tag("")
-          Divider()
-          ForEach(store.specs) { Text($0.title).tag($0.name) }
-        }
-        .pickerStyle(.menu)
-        .fixedSize()
-      }
+      ToolbarSpacer(.fixed)
       ToolbarItem { TableViewMenu() }
     }
   }
@@ -184,7 +216,6 @@ struct PullsPage: View {
 private struct PipelineBar: View {
   @Environment(Store.self) private var store
   @Binding var stage: Stage?
-  let issues: () -> Void
 
   private static let stages: [(Stage, String, String)] = [
     (.queued, "Queued", ""), (.building, "Building", "loop-issue-queue"), (.review, "In Review", "loop-pr-review"),
@@ -193,27 +224,44 @@ private struct PipelineBar: View {
 
   var body: some View {
     HStack(spacing: 0) {
-      ForEach(Array(Self.stages.enumerated()), id: \.offset) { i, s in
-        if i > 0 { Divider().frame(height: 28) }
+      ForEach(Array(Self.stages.enumerated()), id: \.offset) { _, s in
         let count = store.outcomes.filter { !$0.done && $0.stage == s.0 }.count
-        Button {
-          if s.0 == .queued { issues() } else { stage = stage == s.0 ? nil : s.0 }
-        } label: {
-          VStack(spacing: 2) {
-            HStack(spacing: 4) {
-              Text("\(count)").font(.title3.monospacedDigit().weight(.semibold))
-              if store.running[s.2] != nil { WorkingIcon(symbol: Symbols.loop(s.2), size: 12) }
-            }
-            Text(s.1).font(.caption).foregroundStyle(stage == s.0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+        if s.0 == .queued {
+          StageCount(count: count, title: s.1, loop: s.2, picked: false)
+            .help(s.0.hint)
+        } else {
+          Button {
+            stage = stage == s.0 ? nil : s.0
+          } label: {
+            StageCount(count: count, title: s.1, loop: s.2, picked: stage == s.0)
           }
-          .frame(maxWidth: .infinity)
-          .contentShape(.rect)
+          .buttonStyle(.plain)
+          .help(s.0.hint)
+          .accessibilityAddTraits(stage == s.0 ? .isSelected : [])
         }
-        .buttonStyle(.plain)
-        .help(s.0.hint)
       }
     }
-    .padding(.vertical, 8)
+  }
+}
+
+private struct StageCount: View {
+  @Environment(Store.self) private var store
+  let count: Int
+  let title: String
+  let loop: String
+  let picked: Bool
+
+  var body: some View {
+    VStack(spacing: 2) {
+      HStack(spacing: 4) {
+        Text("\(count)").font(.title3.monospacedDigit().weight(.semibold))
+        if store.running[loop] != nil { WorkingIcon(symbol: Symbols.loop(loop), size: 12).accessibilityLabel("Running") }
+      }
+      Text(title).font(.caption).foregroundStyle(picked ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+    }
+    .frame(maxWidth: .infinity)
+    .contentShape(.rect)
+    .accessibilityElement(children: .combine)
   }
 }
 
@@ -228,7 +276,7 @@ struct PullMenu: View {
       Button("Open Issue #\(f)", systemImage: "smallcircle.circle") { openURL(issue.url) }
     }
     if let pr = outcome.pr, outcome.ready {
-      Button("Merge", systemImage: "arrow.triangle.merge") { store.merge(pr) }
+      Button("Merge…", systemImage: "arrow.triangle.merge") { store.merges = [pr] }
         .disabled(store.merging.contains(pr.number) || store.mergedNow.contains(pr.number))
     }
     if let pr = outcome.pr, pr.open, !outcome.ready {

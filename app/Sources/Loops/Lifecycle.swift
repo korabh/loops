@@ -103,9 +103,10 @@ enum Lifecycle {
   static func reporter(of file: String, in projects: [String]) -> String? {
     guard let root = projects.first(where: { file.hasPrefix($0 + "/") }) else { return nil }
     let parts = file.dropFirst(root.count + 1).split(separator: "/")
-    guard let name = parts.last, name.hasSuffix(".jsonl") else { return "" }
-    if parts.count == 1 { return String(name.dropLast(6)) }
-    return name.hasPrefix("agent-") ? String(name.dropFirst(6).dropLast(6)) : ""
+    guard let name = parts.last else { return "" }
+    if parts.count == 1 { return name.hasSuffix(".jsonl") ? String(name.dropLast(6)) : "" }
+    if name.hasPrefix("agent-"), name.hasSuffix(".jsonl") { return String(name.dropFirst(6).dropLast(6)) }
+    return String(parts[0])
   }
 }
 
@@ -126,6 +127,7 @@ extension Store {
 
   func receive(_ e: HookEvent) {
     hooked.insert(e.agent ?? e.session)
+    heard = e.at
     let job = jobs.jobs.values.first { $0.sessionId == e.session }
     let runner = fromRunner(e)
     switch e.name {

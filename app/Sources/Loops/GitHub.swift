@@ -84,9 +84,10 @@ struct PullRequest: Decodable, Hashable, Identifiable {
     let body = (try? c.decode(String.self, forKey: .body)) ?? ""
     door = Reader.groups(#"\*\*Door:\*\*\s*([A-Za-z-]+)"#, in: body).first?.lowercased()
     blast = Reader.groups(#"\*\*Blast Radius:\*\*\s*([^\n]+)"#, in: body).first?.trimmingCharacters(in: .whitespaces)
-    let keyword = try! Regex(#"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)"#)
-    closes = body.matches(of: keyword).compactMap { $0.output[1].substring.flatMap { Int($0) } }
+    closes = body.matches(of: Self.keyword).compactMap { $0.output[1].substring.flatMap { Int($0) } }
   }
+
+  private static let keyword = try! Regex(#"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)"#)
 
   var oneWay: Bool { door == "one-way" }
 

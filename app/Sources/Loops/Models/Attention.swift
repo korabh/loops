@@ -28,10 +28,9 @@ enum Holder: Int, CaseIterable, Identifiable {
   var tint: Color {
     switch self {
     case .merge: .green
-    case .fix: .orange
-    case .decide: .blue
+    case .fix, .decide: .orange
     case .checks: .red
-    case .loops: .gray.opacity(0.55)
+    case .loops: .secondary
     }
   }
 
@@ -180,7 +179,7 @@ struct Wait: Identifiable, Equatable {
   static func reviewed(_ briefs: [Brief]) -> [Int: Date] {
     var out: [Int: Date] = [:]
     for b in briefs where b.loop == "loop-pr-review" {
-      for line in b.text.split(separator: "\n") {
+      for line in b.text.split(separator: "\n") where line.hasPrefix("#") {
         guard let n = Reader.groups(#"^#(\d+) "#, in: line).first.flatMap(Int.init) else { continue }
         out[n] = max(out[n] ?? b.at, b.at)
       }

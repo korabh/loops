@@ -34,13 +34,15 @@ struct SchedulePage: View {
     .sorted(using: sortOrder)
     Table(rows, selection: $selection, sortOrder: $sortOrder, columnCustomization: $columns) {
       TableColumn("Loop", value: \ScheduleLine.title) { r in
-        Label { Text(r.title) } icon: { Image(icon: Symbols.loop(r.id), size: 14) }
+        Label { Text(r.title) } icon: { RowIcon(symbol: Symbols.loop(r.id)) }
           .help(store.descriptions[r.id] ?? r.title)
       }
       .width(min: 140, ideal: 200)
       .customizationID("loop")
+      .disabledCustomizationBehavior(.visibility)
       TableColumn("Group", value: \ScheduleLine.group).width(min: 50, ideal: 70)
         .customizationID("group")
+        .defaultVisibility(.hidden)
       TableColumn("Status", value: \ScheduleLine.rank) { r in
         StatusLabel(title: r.status.title, symbol: r.status.symbol, tint: r.status.tint, spinning: r.status.active)
       }
@@ -75,6 +77,7 @@ struct SchedulePage: View {
       TableColumn("Model", value: \ScheduleLine.model) { r in Text(r.model.capitalized).foregroundStyle(.secondary) }
         .width(min: 50, ideal: 70)
         .customizationID("model")
+        .defaultVisibility(.hidden)
     }
     .tableAppearance()
     .contextMenu(forSelectionType: String.self) { ids in
@@ -83,10 +86,15 @@ struct SchedulePage: View {
       if let id = ids.first { store.page = .loop(id) }
     }
     .focusedSceneValue(\.selected, Selected(loops: Array(selection)))
-    .navigationTitle("Schedule")
-    .navigationSubtitle("Next tick \(Clock.time(store.nextTick)) · \(plural(store.running.count, "loop")) running")
+    .overlay {
+      if rows.isEmpty {
+        EmptyState(title: "No Loops", icon: "calendar") {
+          Button("New Loop…") { store.editing = .add }
+        }
+      }
+    }
+    .pageTitle("Schedule")
     .toolbar {
-      ToolbarSpacer(.flexible)
       ToolbarItem {
         Button("Run Now", icon: "play") {
           for id in selection { store.runNow(id) }
@@ -98,6 +106,7 @@ struct SchedulePage: View {
         Button("New Loop…", icon: "plus") { store.editing = .add }
           .help("Add a loop; opens a pull request")
       }
+      ToolbarSpacer(.fixed)
       ToolbarItem { TableViewMenu() }
     }
   }

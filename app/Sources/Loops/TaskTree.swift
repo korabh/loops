@@ -19,7 +19,6 @@ struct SubAgent: Equatable, Identifiable {
   let state: State
 }
 
-@MainActor
 enum SubAgents {
   private struct Meta {
     let id: String
@@ -37,18 +36,25 @@ enum SubAgents {
     var results: Set<String> = []
   }
 
-  private static var marks: [String: Marks] = [:]
-  private static var heads: [String: (started: Date?, prompt: String?)] = [:]
-  private static var ends: [String: (size: Int, ended: Bool)] = [:]
-  private static var cache: [String: (stamp: String, agents: [SubAgent])] = [:]
+  nonisolated(unsafe) private static var marks: [String: Marks] = [:]
+  nonisolated(unsafe) private static var heads: [String: (started: Date?, prompt: String?)] = [:]
+  nonisolated(unsafe) private static var ends: [String: (size: Int, ended: Bool)] = [:]
+  nonisolated(unsafe) private static var cache: [String: (stamp: String, agents: [SubAgent], used: Date)] = [:]
+  private static let lock = NSLock()
   private static let notice = try! Regex(#"<task-id>([0-9a-z]+)</task-id>.*?<status>([a-z_]+)</status>"#)
   private static let result = try! Regex(#""tool_use_id":"(toolu_[A-Za-z0-9]+)""#)
 
   static func read(_ transcript: URL, live: Bool) -> [SubAgent] {
+    lock.lock()
+    defer { lock.unlock() }
+    sweep(Date())
     let dir = transcript.deletingPathExtension().appending(path: "subagents")
     let runs = names(dir.appending(path: "workflows")).filter { $0.hasPrefix("wf_") }.map { dir.appending(path: "workflows/\($0)") }
     let stamp = ([transcript, dir] + runs + runs.map { $0.appending(path: "journal.jsonl") }).map(stat).joined(separator: "|") + "|\(live)"
-    if let hit = cache[transcript.path], hit.stamp == stamp { return hit.agents }
+    if let hit = cache[transcript.path], hit.stamp == stamp {
+      cache[transcript.path]?.used = Date()
+      return hit.agents
+    }
 
     var metas = names(dir).filter { $0.hasSuffix(".meta.json") }.compactMap { meta(dir.appending(path: $0)) }
     var journal: [String: String] = [:]
@@ -94,8 +100,18 @@ enum SubAgents {
           started: kids.compactMap(\.started).min(), last: kids.compactMap(\.last).max(), state: state))
     }
     agents.sort { ($0.started ?? .distantPast) < ($1.started ?? .distantPast) }
-    cache[transcript.path] = (stamp, agents)
+    cache[transcript.path] = (stamp, agents, Date())
     return agents
+  }
+
+  private static func sweep(_ now: Date) {
+    let stale = cache.filter { now.timeIntervalSince($0.value.used) > 600 }.map { String($0.key.dropLast(".jsonl".count)) }
+    guard !stale.isEmpty else { return }
+    let owned = { (path: String) in stale.contains { path.hasPrefix($0) } }
+    cache = cache.filter { !owned($0.key) }
+    marks = marks.filter { !owned($0.key) }
+    heads = heads.filter { !owned($0.key) }
+    ends = ends.filter { !owned($0.key) }
   }
 
   private static func names(_ dir: URL) -> [String] {
@@ -189,8 +205,13 @@ enum SubAgents {
 }
 
 extension Store {
-  func subAgents(_ t: BgTask) -> [SubAgent] {
-    transcript(t).map { SubAgents.read($0, live: t.active) } ?? []
+  func loadSubAgents(_ t: BgTask) async -> [SubAgent] {
+    let path = jobs.jobs[t.id]?.transcript
+    let configs = configs
+    let live = t.active
+    return await Task.detached(priority: .userInitiated) {
+      Store.transcript(path: path, session: t.sessionId, cwd: t.cwd, configs: configs).map { SubAgents.read($0, live: live) } ?? []
+    }.value
   }
 
   func finishes(_ t: BgTask, plan: [PlanStep], now: Date) -> Date? {

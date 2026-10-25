@@ -102,6 +102,7 @@ final class Directions {
   private(set) var since: Date?
   private(set) var failure: String?
   private(set) var destination: String
+  private(set) var seen: String?
 
   private static let listKey = "directions"
   private static let atKey = "directionsAt"
@@ -151,9 +152,21 @@ final class Directions {
     }
   }
 
-  func stale(_ seen: String) -> Bool { at != nil && (fingerprint != seen || (basis ?? Self.defaultDestination) != goal) }
+  var stale: Bool { at != nil && ((seen != nil && fingerprint != seen) || (basis ?? Self.defaultDestination) != goal) }
 
-  static func fingerprint(_ paths: Paths) -> String {
+  func watch(store: Store) async {
+    let paths = store.paths
+    while !Task.isCancelled {
+      let now = await Task.detached { Self.fingerprint(paths) }.value
+      if now != seen {
+        seen = now
+        await count(store: store)
+      }
+      try? await Task.sleep(for: .seconds(15))
+    }
+  }
+
+  nonisolated static func fingerprint(_ paths: Paths) -> String {
     ["notes.md", "log.md", "answers.jsonl"].map { name in
       let a = try? FileManager.default.attributesOfItem(atPath: paths.loops.appending(path: name).path)
       let size = (a?[.size] as? Int) ?? 0
@@ -224,6 +237,7 @@ final class Directions {
       at = Date()
       usage = Usage(result: obj)
       fingerprint = seen
+      self.seen = seen
       basis = aim
       let d = defaults
       d.set(try? JSONEncoder().encode(list), forKey: Self.listKey)

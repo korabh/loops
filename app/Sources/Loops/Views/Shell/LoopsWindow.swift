@@ -2,8 +2,6 @@ import SwiftUI
 
 struct LoopsWindow: View {
   @Environment(Store.self) private var store
-  @Environment(Workspace.self) private var workspace
-  @Environment(\.openWindow) private var openWindow
   @State private var query = ""
 
   var body: some View {
@@ -15,9 +13,9 @@ struct LoopsWindow: View {
     } detail: {
       Detail(page: store.page ?? .home)
     }
-    .toolbar { ProjectSwitcher(workspace: workspace) }
+    .focusedSceneValue(\.project, store)
+    .tracksVisibility(of: store)
     .task { await store.refresh() }
-    .onAppear { store.showWindow = { openWindow(id: "loops") } }
     .sheet(item: $store.editing) { mode in
       switch mode {
       case .add: LoopEditor(mode: mode, original: LoopDraft())
@@ -52,11 +50,12 @@ private struct Presenters: View {
           store.merges.count == 1 ? "Merge #\(store.merges[0].number) into main?" : "Merge \(store.merges.count) pull requests into main?",
           isPresented: Binding(get: { !store.merges.isEmpty }, set: { if !$0 { store.merges = [] } })
         ) {
-          Button("Merge") { store.merges.forEach(store.merge) }
+          Button("Merge", role: store.merges.contains(where: \.oneWay) ? .destructive : nil) { store.merges.forEach(store.merge) }
           Button("Cancel", role: .cancel) {}
         } message: {
           Text(store.merges.map { "#\($0.number) \($0.tidyTitle)\($0.oneWay ? " · one-way door" : "")" }.joined(separator: "\n"))
         }
+        .dialogSeverity(store.merges.contains(where: \.oneWay) ? .critical : .automatic)
       Color.clear
         .confirmationDialog(
           store.proposed.map { "Change \(store.title($0.loop)) to \($0.label)?" } ?? "",
@@ -68,8 +67,33 @@ private struct Presenters: View {
         } message: { _ in
           Text("The change applies once its pull request merges.")
         }
+      Color.clear
+        .confirmationDialog(
+          store.ci.request?.title ?? "",
+          isPresented: Binding(get: { store.ci.request != nil }, set: { if !$0 { store.ci.request = nil } }),
+          presenting: store.ci.request
+        ) { request in
+          Button(request.op == .start ? "Start" : "Stop", role: request.op == .stop ? .destructive : nil) {
+            store.ci.confirm(request, store: store)
+          }
+          Button("Cancel", role: .cancel) {}
+        } message: { request in
+          Text(request.message)
+        }
+      Color.clear
+        .confirmationDialog(
+          removing.count == 1 ? "Remove \u{201C}\(removing.first.map(Store.short) ?? "")\u{201D}?" : "Remove \(removing.count) tasks?",
+          isPresented: Binding(get: { !removing.isEmpty }, set: { if !$0 { Removals.shared.clear(store) } })
+        ) {
+          Button("Remove", role: .destructive) { Removals.shared.confirm(store) }
+          Button("Cancel", role: .cancel) {}
+        } message: {
+          Text("You can't undo this.")
+        }
     }
   }
+
+  private var removing: [BgTask] { Removals.shared.tasks(store) }
 }
 
 private struct Detail: View {
@@ -102,10 +126,28 @@ private struct Detail: View {
   }
 }
 
+extension View {
+  func pageTitle(_ title: String) -> some View {
+    modifier(PageTitle(title: title))
+  }
+}
+
+private struct PageTitle: ViewModifier {
+  @Environment(Store.self) private var store
+  let title: String
+
+  func body(content: Content) -> some View {
+    content
+      .navigationTitle(store.name)
+      .navigationSubtitle(title)
+  }
+}
+
 struct Sidebar: View {
   @Environment(Store.self) private var store
   let query: String
   @AppStorage("collapsedGroups") private var collapsed = ""
+  @Environment(\.sidebarRowSize) private var rowSize
 
   private func expanded(_ group: String) -> Binding<Bool> {
     Binding(
@@ -123,19 +165,20 @@ struct Sidebar: View {
   }
 
   var body: some View {
-    @Bindable var store = store
     let inbox = store.inbox.count
-    List(selection: $store.page) {
+    List(selection: Binding(get: { store.page }, set: { if let page = $0 { store.page = page } })) {
       Section {
         ForEach(Page.top.filter { matches($0.title) }, id: \.self) { page in
           Label {
             HStack {
               Text(page.title)
               Spacer(minLength: 4)
-              if page == .plan, store.planner.busy != nil || store.directions.busy { WorkingIcon(symbol: "asterisk", size: 12) }
+              if page == .plan, store.planner.busy != nil || store.directions.busy {
+                WorkingIcon(symbol: "asterisk", size: 12).accessibilityLabel("Working")
+              }
             }
           } icon: {
-            Image(icon: page.symbol)
+            Image(icon: page.symbol, size: rowSize.icon)
           }
           .badge(page == .inbox ? inbox : 0)
           .tag(page)
@@ -165,6 +208,7 @@ struct Sidebar: View {
 
 private struct LoopRow: View {
   @Environment(Store.self) private var store
+  @Environment(\.sidebarRowSize) private var rowSize
   let spec: LoopSpec
 
   var body: some View {
@@ -173,17 +217,19 @@ private struct LoopRow: View {
     Label {
       Text(spec.title).foregroundStyle(status == .off ? .secondary : .primary)
     } icon: {
-      Image(icon: Symbols.loop(spec.name))
+      Image(icon: Symbols.loop(spec.name), size: rowSize.icon)
         .foregroundStyle(status.active ? .green : status == .failed ? .red : .secondary)
         .pulsing(status.active)
     }
     .badge(waiting)
     .help("\(spec.cadence)\(spec.window.map { ", \($0)" } ?? "") · \(status.title)")
+    .accessibilityValue(status.title)
   }
 }
 
 private struct TaskRow: View {
   @Environment(Store.self) private var store
+  @Environment(\.sidebarRowSize) private var rowSize
   let task: BgTask
 
   var body: some View {
@@ -191,11 +237,12 @@ private struct TaskRow: View {
     Label {
       Text(Store.short(task)).lineLimit(1)
     } icon: {
-      Image(icon: phase == .needsYou ? "questionmark.bubble" : Symbols.askClaude)
+      Image(icon: phase == .needsYou ? "questionmark.bubble" : Symbols.askClaude, size: rowSize.icon)
         .foregroundStyle(phase == .needsYou ? .orange : phase == .working ? .green : .secondary)
         .pulsing(phase == .working)
     }
     .badge(phase == .needsYou ? 1 : 0)
     .help(task.title)
+    .accessibilityValue(store.status(task, phase))
   }
 }

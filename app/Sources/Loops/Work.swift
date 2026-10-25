@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 
-struct Item: Identifiable {
+struct Item: Identifiable, Equatable {
   enum Kind: Int { case merge, review, decide }
 
   let id: String
@@ -31,7 +31,7 @@ struct Item: Identifiable {
   }
 }
 
-struct Step: Identifiable {
+struct Step: Identifiable, Equatable {
   enum Mark { case done, active, failed, todo }
 
   let label: String
@@ -79,7 +79,7 @@ enum Stage: Int, CaseIterable, Identifiable {
   }
 }
 
-struct Outcome: Identifiable {
+struct Outcome: Identifiable, Equatable {
   enum Kind { case pull, issue }
 
   let kind: Kind
@@ -198,37 +198,27 @@ extension Store {
   }
 
   func derive() {
-    verdicts = Self.verdicts(briefs)
-    reviewedAt = Wait.reviewed(briefs)
-    askedAt = Wait.asked(asks, briefs: briefs)
-    var groups: [Int: [Ask]] = [:]
-    var order: [Int] = []
-    var lone: [Item] = []
-    for a in asks {
-      let named = Briefs.numbers(a.text + " " + (a.url?.absoluteString.removingPercentEncoding ?? ""))
-      if let n = named.first(where: { pulls[$0]?.open == true }) {
-        if groups[n] == nil { order.append(n) }
-        groups[n, default: []].append(a)
-      } else {
-        lone.append(Item(id: a.id, kind: .decide, pr: nil, asks: [a]))
-      }
+    derivation += 1
+    let mine = derivation
+    let input = Derivation(
+      briefs: briefs, asks: asks, pulls: pulls, issues: issues, reviewed: reviewed, nextRun: nextRun,
+      titles: Dictionary(specs.map { ($0.name, $0.title) }, uniquingKeysWith: { a, _ in a }), now: now)
+    Task {
+      let out = await Task.detached(priority: .utility) { input.run() }.value
+      guard mine == derivation else { return }
+      update(\.verdicts, out.verdicts)
+      update(\.reviewedAt, out.reviewedAt)
+      update(\.askedAt, out.askedAt)
+      update(\.items, out.items)
+      update(\.outcomes, out.outcomes)
+      announce()
     }
-    let prs = order.compactMap { n -> Item? in
-      guard let asks = groups[n], let pr = pulls[n] else { return nil }
-      return Item(id: "pr-\(n)", kind: mergeState(pr).mergeable ? .merge : .review, pr: pr, asks: asks)
-    }
-    items = (prs + lone).sorted {
-      ($0.kind.rawValue, $0.pr?.oneWay == true ? 0 : 1, -$0.at.timeIntervalSince1970)
-        < ($1.kind.rawValue, $1.pr?.oneWay == true ? 0 : 1, -$1.at.timeIntervalSince1970)
-    }
-    outcomes = buildOutcomes()
-    announce()
   }
 
-  static func verdicts(_ briefs: [Brief]) -> [Int: String] {
+  nonisolated static func verdicts(_ briefs: [Brief]) -> [Int: String] {
     var out: [Int: String] = [:]
     for b in briefs.reversed() where b.loop == "loop-pr-review" {
-      for line in b.text.split(separator: "\n") {
+      for line in b.text.split(separator: "\n") where line.hasPrefix("#") {
         let g = Reader.groups(#"^#(\d+) ([^,(:]+)"#, in: line)
         if g.count == 2, let n = Int(g[0]), out[n] == nil { out[n] = g[1].trimmingCharacters(in: .whitespaces) }
       }
@@ -236,121 +226,31 @@ extension Store {
     return out
   }
 
-  var reviewed: [String: String] {
-    (states["loop-pr-review"]?.raw["reviewed"] as? [String: String]) ?? [:]
+  func refreshGitHub(within: Double = 0) async {
+    await githubFlight.run(within: within) { await self.loadGitHub() }
   }
 
-  private func buildOutcomes() -> [Outcome] {
-    var out: [Outcome] = []
-    let fixer = nextRun["loop-pr-fix"]
-    let reviewer = nextRun["loop-pr-review"]
-    for pr in pulls.values {
-      guard let loop = pr.loop else { continue }
-      let state = mergeState(pr)
-      let verdict = verdicts[pr.number]
-      let current = state != .unreviewed && state != .rereview && reviewed[String(pr.number)] == pr.headRefOid
-      let checks: Step.Mark =
-        pr.merged || (pr.checks.failed == 0 && pr.checks.pending == 0 && pr.checks.total > 0)
-        ? .done : pr.checks.failed > 0 ? .failed : pr.checks.pending > 0 ? .active : .todo
-      let (badge, actor, status, when): (String, String?, String, Date?) =
-        switch state {
-        case .merged: ("Merged", nil, "Merged \(pr.mergedAt.map { Clock.ago($0, now: now) } ?? "")", nil)
-        case .closed: ("Closed", nil, "Closed without merging", nil)
-        case .draft: ("Draft", title(loop), "\(title(loop)) is still building it", nil)
-        case .failing:
-          (
-            "Checks", "PR fixer",
-            "PR fixer fixes \(pr.checks.failing.isEmpty ? "the failing check" : joined(Array(pr.checks.failing.prefix(2))))", fixer
-          )
-        case .checking: ("Checks", "Checks", "Checks are running", nil)
-        case .conflicting: ("Conflicts", "PR fixer", "PR fixer resolves the conflicts with main", fixer)
-        case .unreviewed: ("In review", "PR reviewer", "PR reviewer reviews it", reviewer)
-        case .rereview: ("Re-review", "PR reviewer", "PR reviewer checks the new commits", reviewer)
-        case .fixes(let n): ("Fixing", "PR fixer", "PR fixer takes \(n.map { plural($0, "fix", "fixes") } ?? "the requested fixes")", fixer)
-        case .behind: ("Behind main", "PR fixer", "PR fixer updates it from main", fixer)
-        case .blocked(let hard): ("Blocked", "You", capitalizedFirst(hard), nil)
-        case .ready: ("Ready", "You", "Ready for you to merge", nil)
-        }
-      let stage = state.stage
-      let reviewMark: Step.Mark = pr.merged || current ? .done : stage == .review ? .active : .todo
-      let wantsFixes = if case .fixes = state { true } else { false }
-      let fixMark: Step.Mark = stage == .fixing ? .active : (pr.merged || stage == .ready || (current && !wantsFixes)) ? .done : .todo
-      let mergeMark: Step.Mark = pr.merged ? .done : !pr.open ? .failed : stage == .ready ? .active : .todo
-      out.append(
-        Outcome(
-          kind: .pull, number: pr.number, loop: loop, title: pr.tidyTitle, url: pr.url,
-          at: pr.mergedAt ?? pr.closedAt ?? pr.createdAt ?? now,
-          steps: [
-            Step(label: "Opened", mark: .done), Step(label: "Checks", mark: checks),
-            Step(label: "Reviewed", mark: reviewMark), Step(label: "Fixed", mark: fixMark), Step(label: "Merged", mark: mergeMark),
-          ], status: status, done: !pr.open, stage: stage, pr: pr, fixes: pr.issue, badge: badge, actor: actor, when: when,
-          note: verdict.map { "Review: \(Briefs.readable($0))" }))
-    }
-
-    var filed: [Int: (loop: String, at: Date)] = [:]
-    let re = try! Regex(#"(?i)\bfiled\b[^#\n]{0,180}#(\d+)"#)
-    for b in briefs {
-      for m in b.text.matches(of: re) {
-        if let n = m.output[1].substring.flatMap({ Int($0) }), filed[n] == nil { filed[n] = (b.loop, b.at) }
-      }
-    }
-    for (n, source) in filed {
-      guard let issue = issues[n] else { continue }
-      let pr = pulls.values.filter { $0.issue == n }.max { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
-      if pr != nil { continue }
-      let claimed = !issue.assignees.isEmpty || pr != nil
-      let status: String
-      if !issue.open {
-        status = "Closed \(issue.closedAt.map { Clock.ago($0, now: now) } ?? "")"
-      } else if let pr {
-        status = pr.merged ? "Fixed in #\(pr.number), merged" : "In #\(pr.number), \(pr.open ? "open" : "closed")"
-      } else if claimed {
-        status = "Claimed, being built"
-      } else if issue.labels.contains("ready-for-agent") {
-        status = "Queued for Issue builder"
-      } else {
-        status = "Filed, waiting for triage"
-      }
-      out.append(
-        Outcome(
-          kind: .issue, number: n, loop: source.loop, title: capitalizedFirst(issue.title), url: issue.url,
-          at: issue.createdAt ?? source.at,
-          steps: [
-            Step(label: "Filed", mark: .done), Step(label: "Claimed", mark: claimed || !issue.open ? .done : .todo),
-            Step(label: "In a PR", mark: pr == nil ? (issue.open ? .todo : .done) : (pr?.merged == true ? .done : .active)),
-            Step(label: "Closed", mark: issue.open ? .todo : .done),
-          ], status: status, done: !issue.open,
-          stage: !issue.open ? .done : claimed ? .building : .queued,
-          badge: !issue.open ? "Closed" : claimed ? "Building" : issue.labels.contains("ready-for-agent") ? "Queued" : "Filed",
-          actor: issue.open ? (issue.labels.contains("ready-for-agent") || claimed ? "Issue builder" : "You") : nil,
-          when: issue.open && !claimed && issue.labels.contains("ready-for-agent") ? nextRun["loop-issue-queue"] : nil))
-    }
-    return out.sorted { $0.at > $1.at }
-  }
-
-  func refreshGitHub() async {
+  private func loadGitHub() async {
     async let prs = Shell.exec(
       [
         "gh", "pr", "list", "--state", "all", "--limit", "80", "--json",
         "number,title,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,headRefName,headRefOid,createdAt,updatedAt,mergedAt,closedAt,statusCheckRollup,body",
-      ], in: paths.repo)
+      ], in: paths.repo, qos: .utility)
     async let iss = Shell.exec(
       [
         "gh", "issue", "list", "--state", "all", "--limit", "80", "--json",
         "number,title,url,state,labels,assignees,createdAt,closedAt",
-      ], in: paths.repo)
+      ], in: paths.repo, qos: .utility)
     let (pc, po) = await prs
     let (ic, io) = await iss
     defer { githubLoaded = true }
-    guard pc == 0, ic == 0,
-      let p = try? JSONDecoder().decode([PullRequest].self, from: Data(po.utf8)),
-      let i = try? JSONDecoder().decode([Issue].self, from: Data(io.utf8))
-    else { return }
-    pulls = Dictionary(p.map { ($0.number, $0) }, uniquingKeysWith: { a, _ in a })
-    issues = Dictionary(i.map { ($0.number, $0) }, uniquingKeysWith: { a, _ in a })
-    open = Set(p.filter(\.open).map(\.number) + i.filter(\.open).map(\.number))
+    guard pc == 0, ic == 0 else { return }
+    let decoded = await Task.detached(priority: .utility) { GitHubLists(pulls: po, issues: io) }.value
+    guard let decoded else { return }
+    update(\.pulls, decoded.pulls)
+    update(\.issues, decoded.issues)
+    if update(\.open, decoded.open) { settle() }
     derive()
-    reload()
     await refreshNext()
   }
 
@@ -399,6 +299,7 @@ extension Store {
   func hide(_ item: Item, undo: UndoManager? = nil) {
     for a in item.asks { dismiss(a) }
     items.removeAll { $0.id == item.id }
+    derive()
     undo?.registerUndo(withTarget: self) { store in
       MainActor.assumeIsolated { store.unhide(item) }
     }
@@ -414,7 +315,7 @@ extension Store {
     guard let sha else { return [] }
     var cmd = ["git", "log", "--format=%s", "\(sha)..origin/main"]
     if let path { cmd += ["--", path] }
-    let (code, out) = await Shell.exec(cmd, in: paths.repo)
+    let (code, out) = await Shell.exec(cmd, in: paths.repo, qos: .utility)
     return code == 0 ? out.split(separator: "\n").map(String.init) : []
   }
 
@@ -429,9 +330,14 @@ extension Store {
   }
 
   func refreshNext() async {
-    var out: [String: [String]] = [:]
-    for l in specs { out[l.name] = await next(l) }
-    nextUp = out
+    let specs = specs
+    let out = await withTaskGroup(of: (String, [String]).self) { group in
+      for l in specs { group.addTask { (l.name, await self.next(l)) } }
+      var out: [String: [String]] = [:]
+      for await (name, lines) in group { out[name] = lines }
+      return out
+    }
+    update(\.nextUp, out)
   }
 
   private func next(_ l: LoopSpec) async -> [String] {
@@ -485,7 +391,7 @@ extension Store {
       let drivers = (state?.raw["drivers"] as? [[String: Any]])?.compactMap { $0["function"] as? String } ?? []
       lines.append(drivers.isEmpty ? "This week's Convex spend drivers" : "Re-measures \(joined(drivers))")
     case "loop-parked-branches":
-      let (code, out) = await Shell.exec(["git", "branch", "-r", "--list", "origin/wip/*"], in: paths.repo)
+      let (code, out) = await Shell.exec(["git", "branch", "-r", "--list", "origin/wip/*"], in: paths.repo, qos: .utility)
       let names = code == 0 ? out.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "origin/", with: "") } : []
       lines.append(names.isEmpty ? "No parked wip/ branches" : "Measures drift on \(joined(names))")
     case "loop-dep-drift":
@@ -501,5 +407,163 @@ extension Store {
   var repoSlug: String? {
     guard let config = Reader.text(paths.common.appending(path: "config")) else { return nil }
     return Reader.groups(#"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?\s"#, in: config + "\n").first
+  }
+}
+
+struct GitHubLists {
+  let pulls: [Int: PullRequest]
+  let issues: [Int: Issue]
+  let open: Set<Int>?
+
+  init?(pulls po: String, issues io: String) {
+    guard let p = try? JSONDecoder().decode([PullRequest].self, from: Data(po.utf8)),
+      let i = try? JSONDecoder().decode([Issue].self, from: Data(io.utf8))
+    else { return nil }
+    pulls = Dictionary(p.map { ($0.number, $0) }, uniquingKeysWith: { a, _ in a })
+    issues = Dictionary(i.map { ($0.number, $0) }, uniquingKeysWith: { a, _ in a })
+    open = Set(p.filter(\.open).map(\.number) + i.filter(\.open).map(\.number))
+  }
+}
+
+struct Derivation {
+  struct Result {
+    var verdicts: [Int: String] = [:]
+    var reviewedAt: [Int: Date] = [:]
+    var askedAt: [String: Date] = [:]
+    var items: [Item] = []
+    var outcomes: [Outcome] = []
+  }
+
+  let briefs: [Brief]
+  let asks: [Ask]
+  let pulls: [Int: PullRequest]
+  let issues: [Int: Issue]
+  let reviewed: [String: String]
+  let nextRun: [String: Date]
+  let titles: [String: String]
+  let now: Date
+
+  private static let filedIssue = try! Regex(#"(?i)\bfiled\b[^#\n]{0,180}#(\d+)"#)
+
+  func run() -> Result {
+    var r = Result()
+    r.verdicts = Store.verdicts(briefs)
+    r.reviewedAt = Wait.reviewed(briefs)
+    r.askedAt = Wait.asked(asks, briefs: briefs)
+    var groups: [Int: [Ask]] = [:]
+    var order: [Int] = []
+    var lone: [Item] = []
+    for a in asks {
+      let named = Briefs.numbers(a.text + " " + (a.url?.absoluteString.removingPercentEncoding ?? ""))
+      if let n = named.first(where: { pulls[$0]?.open == true }) {
+        if groups[n] == nil { order.append(n) }
+        groups[n, default: []].append(a)
+      } else {
+        lone.append(Item(id: a.id, kind: .decide, pr: nil, asks: [a]))
+      }
+    }
+    let prs = order.compactMap { n -> Item? in
+      guard let asks = groups[n], let pr = pulls[n] else { return nil }
+      return Item(id: "pr-\(n)", kind: state(pr, r.verdicts).mergeable ? .merge : .review, pr: pr, asks: asks)
+    }
+    r.items = (prs + lone).sorted {
+      ($0.kind.rawValue, $0.pr?.oneWay == true ? 0 : 1, -$0.at.timeIntervalSince1970)
+        < ($1.kind.rawValue, $1.pr?.oneWay == true ? 0 : 1, -$1.at.timeIntervalSince1970)
+    }
+    r.outcomes = outcomes(r.verdicts)
+    return r
+  }
+
+  private func title(_ loop: String) -> String { titles[loop] ?? LoopSpec.short(loop) }
+
+  private func state(_ pr: PullRequest, _ verdicts: [Int: String]) -> MergeState {
+    MergeState.of(pr, reviewed: reviewed[String(pr.number)], verdict: verdicts[pr.number])
+  }
+
+  private func outcomes(_ verdicts: [Int: String]) -> [Outcome] {
+    var out: [Outcome] = []
+    let fixer = nextRun["loop-pr-fix"]
+    let reviewer = nextRun["loop-pr-review"]
+    for pr in pulls.values {
+      guard let loop = pr.loop else { continue }
+      let state = state(pr, verdicts)
+      let verdict = verdicts[pr.number]
+      let current = state != .unreviewed && state != .rereview && reviewed[String(pr.number)] == pr.headRefOid
+      let checks: Step.Mark =
+        pr.merged || (pr.checks.failed == 0 && pr.checks.pending == 0 && pr.checks.total > 0)
+        ? .done : pr.checks.failed > 0 ? .failed : pr.checks.pending > 0 ? .active : .todo
+      let (badge, actor, status, when): (String, String?, String, Date?) =
+        switch state {
+        case .merged: ("Merged", nil, "Merged \(pr.mergedAt.map { Clock.ago($0, now: now) } ?? "")", nil)
+        case .closed: ("Closed", nil, "Closed without merging", nil)
+        case .draft: ("Draft", title(loop), "\(title(loop)) is still building it", nil)
+        case .failing:
+          (
+            "Checks", "PR fixer",
+            "PR fixer fixes \(pr.checks.failing.isEmpty ? "the failing check" : joined(Array(pr.checks.failing.prefix(2))))", fixer
+          )
+        case .checking: ("Checks", "Checks", "Checks are running", nil)
+        case .conflicting: ("Conflicts", "PR fixer", "PR fixer resolves the conflicts with main", fixer)
+        case .unreviewed: ("In review", "PR reviewer", "PR reviewer reviews it", reviewer)
+        case .rereview: ("Re-review", "PR reviewer", "PR reviewer checks the new commits", reviewer)
+        case .fixes(let n): ("Fixing", "PR fixer", "PR fixer takes \(n.map { plural($0, "fix", "fixes") } ?? "the requested fixes")", fixer)
+        case .behind: ("Behind main", "PR fixer", "PR fixer updates it from main", fixer)
+        case .blocked(let hard): ("Blocked", "You", capitalizedFirst(hard), nil)
+        case .ready: ("Ready", "You", "Ready for you to merge", nil)
+        }
+      let stage = state.stage
+      let reviewMark: Step.Mark = pr.merged || current ? .done : stage == .review ? .active : .todo
+      let wantsFixes = if case .fixes = state { true } else { false }
+      let fixMark: Step.Mark = stage == .fixing ? .active : (pr.merged || stage == .ready || (current && !wantsFixes)) ? .done : .todo
+      let mergeMark: Step.Mark = pr.merged ? .done : !pr.open ? .failed : stage == .ready ? .active : .todo
+      out.append(
+        Outcome(
+          kind: .pull, number: pr.number, loop: loop, title: pr.tidyTitle, url: pr.url,
+          at: pr.mergedAt ?? pr.closedAt ?? pr.createdAt ?? now,
+          steps: [
+            Step(label: "Opened", mark: .done), Step(label: "Checks", mark: checks),
+            Step(label: "Reviewed", mark: reviewMark), Step(label: "Fixed", mark: fixMark), Step(label: "Merged", mark: mergeMark),
+          ], status: status, done: !pr.open, stage: stage, pr: pr, fixes: pr.issue, badge: badge, actor: actor, when: when,
+          note: verdict.map { "Review: \(Briefs.readable($0))" }))
+    }
+
+    var filed: [Int: (loop: String, at: Date)] = [:]
+    for b in briefs where b.text.range(of: "filed", options: .caseInsensitive) != nil {
+      for m in b.text.matches(of: Self.filedIssue) {
+        if let n = m.output[1].substring.flatMap({ Int($0) }), filed[n] == nil { filed[n] = (b.loop, b.at) }
+      }
+    }
+    for (n, source) in filed {
+      guard let issue = issues[n] else { continue }
+      let pr = pulls.values.filter { $0.issue == n }.max { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
+      if pr != nil { continue }
+      let claimed = !issue.assignees.isEmpty || pr != nil
+      let status: String
+      if !issue.open {
+        status = "Closed \(issue.closedAt.map { Clock.ago($0, now: now) } ?? "")"
+      } else if let pr {
+        status = pr.merged ? "Fixed in #\(pr.number), merged" : "In #\(pr.number), \(pr.open ? "open" : "closed")"
+      } else if claimed {
+        status = "Claimed, being built"
+      } else if issue.labels.contains("ready-for-agent") {
+        status = "Queued for Issue builder"
+      } else {
+        status = "Filed, waiting for triage"
+      }
+      out.append(
+        Outcome(
+          kind: .issue, number: n, loop: source.loop, title: capitalizedFirst(issue.title), url: issue.url,
+          at: issue.createdAt ?? source.at,
+          steps: [
+            Step(label: "Filed", mark: .done), Step(label: "Claimed", mark: claimed || !issue.open ? .done : .todo),
+            Step(label: "In a PR", mark: pr == nil ? (issue.open ? .todo : .done) : (pr?.merged == true ? .done : .active)),
+            Step(label: "Closed", mark: issue.open ? .todo : .done),
+          ], status: status, done: !issue.open,
+          stage: !issue.open ? .done : claimed ? .building : .queued,
+          badge: !issue.open ? "Closed" : claimed ? "Building" : issue.labels.contains("ready-for-agent") ? "Queued" : "Filed",
+          actor: issue.open ? (issue.labels.contains("ready-for-agent") || claimed ? "Issue builder" : "You") : nil,
+          when: issue.open && !claimed && issue.labels.contains("ready-for-agent") ? nextRun["loop-issue-queue"] : nil))
+    }
+    return out.sorted { $0.at > $1.at }
   }
 }

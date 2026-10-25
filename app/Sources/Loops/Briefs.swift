@@ -18,7 +18,38 @@ enum Briefs {
     return URL(string: url)?.host() ?? url
   }
 
-  nonisolated(unsafe) static var names: [String: String] = [:]
+  nonisolated(unsafe) private static var named: [String: String] = [:]
+  nonisolated(unsafe) private static var version = 0
+  private static let naming = NSLock()
+  private static let readables = memo(NSString.self)
+  private static let attributes = memo(Attributed.self)
+
+  private final class Attributed {
+    let value: AttributedString
+    init(_ value: AttributedString) { self.value = value }
+  }
+
+  private static func memo<T: AnyObject>(_: T.Type) -> NSCache<NSString, T> {
+    let cache = NSCache<NSString, T>()
+    cache.countLimit = 4000
+    return cache
+  }
+
+  static var names: [String: String] {
+    get { naming.withLock { named } }
+    set {
+      naming.withLock {
+        guard named != newValue else { return }
+        named = newValue
+        version += 1
+      }
+    }
+  }
+
+  private static func key(_ text: String) -> (NSString, [String: String]) {
+    let snapshot = naming.withLock { (names: named, version: version) }
+    return ("\(snapshot.version)\u{0}\(text)" as NSString, snapshot.names)
+  }
 
   enum Part {
     case text(String)
@@ -74,12 +105,8 @@ enum Briefs {
     return parts
   }
 
-  static func readable(_ text: some StringProtocol) -> String {
-    var s = String(text).replacingOccurrences(of: "`", with: "")
-    for (name, title) in names {
-      s = s.replacingOccurrences(of: name, with: title)
-    }
-    let sha = #"(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}"#
+  private static let sha = #"(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}"#
+  private static let rules: [(NSRegularExpression, String)] = {
     let rules: [(String, String)] = [
       (#"\b(?:window )?\#(sha)\.\.\#(sha)\b"#, "the latest commits"),
       (#"\bsince \#(sha)\b"#, "since its last run"),
@@ -97,13 +124,33 @@ enum Briefs {
       (#" {2,}"#, " "),
       (#" ([,.:;])"#, "$1"),
     ]
-    for (pattern, template) in rules {
-      s = s.replacingOccurrences(of: pattern, with: template, options: .regularExpression)
+    return rules.compactMap { pattern, template in (try? NSRegularExpression(pattern: pattern)).map { ($0, template) } }
+  }()
+
+  static func readable(_ text: some StringProtocol) -> String {
+    let input = String(text)
+    let (key, names) = key(input)
+    if let hit = readables.object(forKey: key) { return hit as String }
+    var s = input.replacingOccurrences(of: "`", with: "")
+    for (name, title) in names {
+      s = s.replacingOccurrences(of: name, with: title)
     }
+    for (re, template) in rules {
+      s = re.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: template)
+    }
+    readables.setObject(s as NSString, forKey: key)
     return s
   }
 
   static func attributed(_ text: String) -> AttributedString {
+    let (key, _) = key(text)
+    if let hit = attributes.object(forKey: key) { return hit.value }
+    let made = attribute(text)
+    attributes.setObject(Attributed(made), forKey: key)
+    return made
+  }
+
+  private static func attribute(_ text: String) -> AttributedString {
     var md = ""
     var last = text.startIndex
     for m in text.matches(of: link) {
@@ -118,10 +165,11 @@ enum Briefs {
     return (try? AttributedString(markdown: md, options: options)) ?? AttributedString(text)
   }
 
+  private static let number = try! Regex(#"(?:#|/pull/|/issues/)(\d+)\b"#)
+
   static func numbers(_ s: String) -> [Int] {
-    let re = try! Regex(#"(?:#|/pull/|/issues/)(\d+)\b"#)
     var seen = Set<Int>()
-    return s.matches(of: re).compactMap { m in m.output[1].substring.flatMap { Int($0) } }.filter { seen.insert($0).inserted }
+    return s.matches(of: number).compactMap { m in m.output[1].substring.flatMap { Int($0) } }.filter { seen.insert($0).inserted }
   }
 
   static func sentences(_ s: String) -> [String] {

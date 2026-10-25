@@ -46,7 +46,7 @@ struct Ask: Identifiable, Hashable {
   let at: Date
 }
 
-struct RunnerState: Decodable {
+struct RunnerState: Decodable, Equatable {
   struct Account: Decodable, Hashable, Identifiable {
     let dir: String
     let email: String?
@@ -58,7 +58,7 @@ struct RunnerState: Decodable {
     var name: String { email ?? dir }
   }
 
-  struct Session: Decodable {
+  struct Session: Decodable, Equatable {
     let id: String?
     let state: String?
     let waitingFor: String?
@@ -200,15 +200,26 @@ enum Reader {
     return f
   }()
 
-  static func date(_ s: String) -> Date? { iso.date(from: s) ?? isoFraction.date(from: s) }
+  static func date(_ s: String) -> Date? { isoFraction.date(from: s) ?? iso.date(from: s) }
 
   static func text(_ url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
 
-  static func groups(_ pattern: String, in s: some StringProtocol) -> [String] {
-    guard let re = try? Regex(pattern), let m = String(s).firstMatch(of: re) else { return [] }
-    return m.output.dropFirst().compactMap { $0.substring.map(String.init) }
+  nonisolated(unsafe) private static var compiled: [String: Regex<AnyRegexOutput>] = [:]
+  private static let compiling = NSLock()
+
+  static func regex(_ pattern: String) -> Regex<AnyRegexOutput>? {
+    compiling.lock()
+    defer { compiling.unlock() }
+    if let hit = compiled[pattern] { return hit }
+    guard let re = try? Regex(pattern) else { return nil }
+    compiled[pattern] = re
+    return re
   }
 
+  static func groups(_ pattern: String, in s: some StringProtocol) -> [String] {
+    guard let re = regex(pattern), let m = String(s).firstMatch(of: re) else { return [] }
+    return m.output.dropFirst().compactMap { $0.substring.map(String.init) }
+  }
 
   static func states(_ dir: URL) -> [String: LoopState] {
     let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []

@@ -1,7 +1,10 @@
 import SwiftUI
 
 struct InboxPage: View {
+  static let emptyDetail = "Answers, merges, fixes and decisions show up here."
+
   @Environment(Store.self) private var store
+  @Environment(\.undoManager) private var undo
   @AppStorage("inboxInspector") private var inspector = true
 
   var body: some View {
@@ -10,10 +13,10 @@ struct InboxPage: View {
     let selected = rows.first { $0.id == store.inboxSelection }
     Group {
       if rows.isEmpty {
-        ContentUnavailableView {
-          Label { Text(store.githubLoaded ? "Nothing Needs You" : "Loading") } icon: { Image(icon: "checkmark.circle", size: 32) }
-        } description: {
-          Text("Answers, merges, fixes and decisions show up here.")
+        if store.githubLoaded {
+          EmptyState(title: "Nothing Needs You", icon: "checkmark.circle", detail: Self.emptyDetail)
+        } else {
+          EmptyState(loading: "Loading inbox")
         }
       } else {
         List(selection: $store.inboxSelection) {
@@ -24,21 +27,26 @@ struct InboxPage: View {
                 ForEach(group) { row in
                   InboxLine(row: row) { open(row) }
                     .tag(row.id)
-                    .contextMenu { InboxMenu(row: row) }
                 }
               }
             }
           }
         }
         .listStyle(.inset)
+        .contextMenu(forSelectionType: String.self) { ids in
+          if let id = ids.first, let row = rows.first(where: { $0.id == id }) { InboxMenu(row: row, undo: undo).environment(store) }
+        } primaryAction: { ids in
+          if let id = ids.first, let row = rows.first(where: { $0.id == id }) { open(row) }
+        }
+        .onDeleteCommand {
+          if case .item(let item)? = selected?.source, !item.asks.isEmpty { store.hide(item, undo: undo) }
+        }
       }
     }
     .focusedSceneValue(\.selected, selected.map(Self.selection))
     .copyable(selected.map { Self.selection($0).urls } ?? [])
-    .navigationTitle("Inbox")
-    .navigationSubtitle(rows.isEmpty ? "" : plural(rows.count, "item"))
+    .pageTitle("Inbox")
     .toolbar {
-      ToolbarSpacer(.flexible)
       ToolbarItem {
         Button("Details", icon: "sidebar.right") { inspector.toggle() }
           .help(inspector ? "Hide details" : "Show details")
@@ -73,11 +81,67 @@ struct InboxPage: View {
   }
 }
 
+private struct InboxLine: View {
+  let row: InboxRow
+  let open: () -> Void
+
+  var body: some View {
+    LabeledContent {
+      InboxAction(row: row, open: open)
+    } label: {
+      Label {
+        VStack(alignment: .leading, spacing: 2) {
+          Text(Briefs.attributed(row.title)).lineLimit(2)
+          if !row.detail.isEmpty {
+            Text(row.detail).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+          }
+        }
+      } icon: {
+        Image(icon: row.kind.symbol).foregroundStyle(row.kind.tint)
+      }
+    }
+  }
+}
+
+private struct InboxAction: View {
+  @Environment(Store.self) private var store
+  let row: InboxRow
+  let open: () -> Void
+
+  var body: some View {
+    switch row.source {
+    case .task:
+      Button("Answer", action: open)
+    case .item(let item):
+      if let pr = item.pr {
+        if store.mergeState(pr).mergeable {
+          MergeButton(pr: pr)
+        } else if store.asking.contains(item.id) {
+          ProgressView().controlSize(.small)
+        } else if store.started[item.id] != nil {
+          Text("Started").foregroundStyle(.secondary)
+        } else {
+          Button("Fix") { store.askClaude(item, fix: true) }
+            .help("Ask Claude Code to fix what blocks it")
+        }
+      } else {
+        Button("Reply", action: open)
+      }
+    case .problem(let p):
+      if store.ci.busy(p) {
+        ProgressView().controlSize(.small)
+      } else if let action = p.action {
+        Button(action) { store.ci.perform(p, store: store) }
+      }
+    }
+  }
+}
+
 private struct InboxMenu: View {
   @Environment(Store.self) private var store
-  @Environment(\.undoManager) private var undo
   @Environment(\.openURL) private var openURL
   let row: InboxRow
+  let undo: UndoManager?
 
   var body: some View {
     switch row.source {
@@ -90,7 +154,7 @@ private struct InboxMenu: View {
       if let pr = item.pr {
         Button("Open #\(pr.number) on GitHub", systemImage: "safari") { openURL(pr.url) }
         if store.mergeState(pr).mergeable {
-          Button("Merge", systemImage: "arrow.triangle.merge") { store.merge(pr) }
+          Button("Merge…", systemImage: "arrow.triangle.merge") { store.merges = [pr] }
             .disabled(store.merging.contains(pr.number))
         } else {
           Button("Fix with Claude Code", systemImage: "wrench.adjustable") { store.askClaude(item, fix: true) }

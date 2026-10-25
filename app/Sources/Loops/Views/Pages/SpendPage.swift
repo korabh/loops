@@ -39,22 +39,17 @@ struct SpendPage: View {
   @State private var finding: String?
 
   var body: some View {
-    let s = store.spend
     Group {
       switch tab {
-      case .loops: SpendTable()
-      case .save: SavingsTable(selection: $finding)
+      case .loops:
+        SpendTable().bottomBar { SpendPanel() }
+      case .save:
+        let advice = (store.fixedAdvice.map { [$0] } ?? []) + store.topAdvice
+        SavingsTable(advice: advice, selection: $finding).bottomBar { SavingPanel(advice: advice.first { $0.id == finding }) }
       }
     }
-    .safeAreaInset(edge: .bottom, spacing: 0) {
-      VStack(spacing: 0) {
-        Divider()
-        if tab == .save { SavingPanel(id: finding) } else { SpendPanel() }
-      }
-      .background(.bar)
-    }
-    .navigationTitle("Spend")
-    .navigationSubtitle(s.loaded ? "\(s.week.spent) this week (est.)" : "")
+    .pageTitle("Spend")
+    .viewTabs($tab, Tab.allCases) { $0.title }
     .toolbar {
       ToolbarItem(placement: .principal) {
         Picker("Show", selection: $tab) {
@@ -63,6 +58,7 @@ struct SpendPage: View {
         .pickerStyle(.segmented)
         .labelsHidden()
       }
+      ToolbarSpacer(.fixed)
       ToolbarItem { TableViewMenu() }
     }
   }
@@ -89,10 +85,11 @@ private struct SpendTable: View {
       .sorted(using: sortOrder)
     Table(rows, selection: $selection, sortOrder: $sortOrder, columnCustomization: $columns) {
       TableColumn("Loop", value: \SpendLine.title) { r in
-        Label { Text(r.title) } icon: { Image(icon: Symbols.loop(r.id), size: 14) }
+        Label { Text(r.title) } icon: { RowIcon(symbol: Symbols.loop(r.id)) }
       }
       .width(min: 140, ideal: 190)
       .customizationID("loop")
+      .disabledCustomizationBehavior(.visibility)
       TableColumn("Runs", value: \SpendLine.runs) { r in Text("\(r.runs)").monospacedDigit() }.width(min: 36, ideal: 44)
         .customizationID("runs")
       TableColumn("Did Work", value: \SpendLine.didWork) { r in
@@ -110,9 +107,9 @@ private struct SpendTable: View {
       .width(min: 36, ideal: 48)
       .customizationID("failed")
       TableColumn("Per Run", value: \SpendLine.perRun) { r in
-        Text(r.perRun.usd).monospacedDigit().help("\(r.perf.runTokens.compact) tokens a run, median")
+        Text("\(r.perRun.usd) · \(r.perf.runTokens.compact) tokens").monospacedDigit().help("Mean cost and median tokens a run")
       }
-      .width(min: 50, ideal: 64)
+      .width(min: 90, ideal: 130)
       .customizationID("per-run")
       TableColumn("Today", value: \SpendLine.today) { r in
         Text(r.today > 0 ? r.today.usd : "–").monospacedDigit().foregroundStyle(.secondary)
@@ -146,7 +143,7 @@ private struct SpendTable: View {
     .focusedSceneValue(\.selected, Selected(loops: Array(selection)))
     .overlay {
       if !store.spend.loaded {
-        ProgressView("Reading transcripts")
+        EmptyState(loading: "Reading transcripts")
       } else if rows.isEmpty {
         EmptyState(title: "No Runs in 7 Days", icon: "chart.bar")
       }
@@ -156,12 +153,12 @@ private struct SpendTable: View {
 
 private struct SavingsTable: View {
   @Environment(Store.self) private var store
+  let advice: [Advice]
   @Binding var selection: String?
   @State private var sortOrder = [KeyPathComparator(\SavingLine.saves, order: .reverse)]
   @SceneStorage("SavingLineColumns") private var columns: TableColumnCustomization<SavingLine>
 
   var body: some View {
-    let advice = (store.fixedAdvice.map { [$0] } ?? []) + store.topAdvice
     let rows = advice.map { SavingLine(advice: $0, loop: $0.loop.map(store.title) ?? "All loops") }.sorted(using: sortOrder)
     Table(rows, selection: $selection, sortOrder: $sortOrder, columnCustomization: $columns) {
       TableColumn("Finding", value: \SavingLine.title) { r in
@@ -169,6 +166,7 @@ private struct SavingsTable: View {
       }
       .width(min: 180, ideal: 280)
       .customizationID("finding")
+      .disabledCustomizationBehavior(.visibility)
       TableColumn("Loop", value: \SavingLine.loop) { r in Text(r.loop).foregroundStyle(.secondary) }.width(min: 80, ideal: 120)
         .customizationID("loop")
       TableColumn("Saves/Week", value: \SavingLine.saves) { r in
@@ -196,14 +194,16 @@ private struct SavingsTable: View {
         }
       }
     } primaryAction: { ids in
-      if let id = ids.first, let a = advice.first(where: { $0.id == id }) { store.act(a) }
+      if let id = ids.first, let loop = advice.first(where: { $0.id == id })?.loop { store.page = .loop(loop) }
     }
     .task(id: rows.map(\.id)) {
       if selection == nil || !rows.contains(where: { $0.id == selection }) { selection = rows.first?.id }
     }
     .overlay {
-      if rows.isEmpty {
-        EmptyState(title: store.spend.loaded ? "Nothing to Cut This Week" : "Reading Transcripts", icon: "leaf")
+      if !store.spend.loaded {
+        EmptyState(loading: "Reading transcripts")
+      } else if rows.isEmpty {
+        EmptyState(title: "Nothing to Cut This Week", icon: "leaf")
       }
     }
   }
@@ -211,12 +211,11 @@ private struct SavingsTable: View {
 
 private struct SavingPanel: View {
   @Environment(Store.self) private var store
-  let id: String?
+  let advice: Advice?
 
   var body: some View {
-    let advice = (store.fixedAdvice.map { [$0] } ?? []) + store.topAdvice
     Group {
-      if let a = advice.first(where: { $0.id == id }) {
+      if let a = advice {
         HStack(alignment: .top, spacing: 24) {
           VStack(alignment: .leading, spacing: 4) {
             Text(a.title).font(.headline)
@@ -243,13 +242,12 @@ private struct SavingPanel: View {
           .frame(maxWidth: .infinity, alignment: .leading)
       }
     }
-    .padding(.horizontal, 16)
-    .padding(.vertical, 12)
   }
 }
 
 private struct SpendPanel: View {
   @Environment(Store.self) private var store
+  @State private var method = false
 
   var body: some View {
     let s = store.spend
@@ -268,11 +266,11 @@ private struct SpendPanel: View {
         }
         GridRow {
           Text("The runner itself").foregroundStyle(.secondary)
-          Text(s.runner.cost > 0 ? "\(s.runner.cost.usd) today" : "–").monospacedDigit()
+          Text(s.runner.cost > 0 ? "\(s.runner.spent) today" : "–").monospacedDigit().help(s.runner.detail)
         }
         GridRow {
           Text("Claude Code tasks").foregroundStyle(.secondary)
-          Text(s.tasks.cost > 0 ? "\(s.tasks.cost.usd) today" : "–").monospacedDigit()
+          Text(s.tasks.cost > 0 ? "\(s.tasks.spent) today" : "–").monospacedDigit().help(s.tasks.detail)
         }
         GridRow {
           Text("Setup share").foregroundStyle(.secondary)
@@ -282,125 +280,18 @@ private struct SpendPanel: View {
         }
       }
       Spacer(minLength: 0)
-      Image(icon: "info.circle")
+      Button("How Costs Are Estimated", icon: "info.circle") { method.toggle() }
+        .labelStyle(.iconOnly)
+        .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(SpendPage.method(s))
+        .help("How costs are estimated")
+        .popover(isPresented: $method, arrowEdge: .top) {
+          Text(SpendPage.method(s))
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(width: 320)
+            .padding()
+        }
     }
-    .padding(.horizontal, 16)
-    .padding(.vertical, 10)
     .redacted(reason: s.loaded ? [] : .placeholder)
-  }
-}
-
-struct AdviceStatus: View {
-  @Environment(Store.self) private var store
-  let advice: Advice
-
-  var body: some View {
-    if let task = store.adviceTask(advice) {
-      let phase = store.phase(task)
-      StatusLabel(title: store.status(task, phase), symbol: "asterisk", tint: phase.tint, spinning: phase == .working)
-    } else if case .model(let m)? = advice.action, let loop = advice.loop {
-      if let found = store.modelPR(loop, model: m) {
-        StatusLabel(
-          title: found.pull?.merged == true ? "Merged" : "PR #\(found.pr.number) open", symbol: "arrow.triangle.pull",
-          tint: found.pull?.merged == true ? .purple : .green)
-      } else if let c = store.changes[loop], c.change.model == m {
-        if c.working {
-          StatusLabel(title: "Opening PR", symbol: "", spinning: true)
-        } else if let f = c.failure {
-          StatusLabel(title: "Failed", symbol: "xmark.circle", tint: .red).help(f)
-        }
-      } else {
-        Text("Suggested").foregroundStyle(.secondary)
-      }
-    } else {
-      Text("Suggested").foregroundStyle(.secondary)
-    }
-  }
-}
-
-struct AdviceButton: View {
-  @Environment(Store.self) private var store
-  @Environment(\.openURL) private var openURL
-  let advice: Advice
-
-  var body: some View {
-    switch advice.action {
-    case .ask(let label, let prompt, let done)?:
-      if let task = store.adviceTask(advice) {
-        Button("Open") { store.page = .task(task.stable) }
-      } else {
-        let key = "advice:\(advice.id)"
-        Button(store.asking.contains(key) ? "Starting…" : "Ask Claude") { store.ask(prompt, loop: advice.loop, from: key, done: done) }
-          .disabled(store.asking.contains(key))
-          .help(label)
-      }
-    case .model(let model)?:
-      if let loop = advice.loop {
-        if let found = store.modelPR(loop, model: model) {
-          Button("View PR") { openURL(found.pr.url) }
-        } else if let spec = store.specs.first(where: { $0.name == loop }) {
-          Button("Switch to \(model.capitalized)…") { store.proposed = .model(spec, model) }
-            .disabled(store.changes[loop]?.working == true)
-        }
-      }
-    case .retro?:
-      if let task = store.adviceTask(advice) {
-        Button("Open") { store.page = .task(task.stable) }
-      } else if let loop = advice.loop {
-        let busy = store.asking.contains("retro-report:\(loop)")
-        Button(busy ? "Starting…" : "Run Retro") { store.startReport(loop) }
-          .disabled(busy)
-          .help("A read-only Claude Code retro on this skill")
-      }
-    case nil:
-      EmptyView()
-    }
-  }
-}
-
-extension Store {
-  func actTitle(_ a: Advice) -> String {
-    if adviceTask(a) != nil { return "Open Task" }
-    switch a.action {
-    case .ask?: return "Ask Claude"
-    case .model(let m)?: return a.loop.flatMap { modelPR($0, model: m) } == nil ? "Switch to \(m.capitalized)…" : "View Pull Request"
-    case .retro?: return "Run Retro"
-    case nil: return "Show Details"
-    }
-  }
-
-  func act(_ a: Advice) {
-    if let t = adviceTask(a) {
-      page = .task(t.stable)
-      return
-    }
-    switch a.action {
-    case .ask(_, let prompt, let done)?:
-      let key = "advice:\(a.id)"
-      guard !asking.contains(key) else { return }
-      ask(prompt, loop: a.loop, from: key, done: done)
-    case .model(let m)?:
-      guard let loop = a.loop else { return }
-      if let found = modelPR(loop, model: m) {
-        NSWorkspace.shared.open(found.pr.url)
-      } else if let spec = specs.first(where: { $0.name == loop }), changes[loop]?.working != true {
-        proposed = .model(spec, m)
-      }
-    case .retro?:
-      guard let loop = a.loop, !asking.contains("retro-report:\(loop)") else { return }
-      startReport(loop)
-    case nil:
-      break
-    }
-  }
-
-  func adviceTask(_ a: Advice) -> BgTask? {
-    switch a.action {
-    case .ask?: task(key: "advice:\(a.id)")
-    case .retro?: a.loop.flatMap { reportTask($0) }.flatMap { $0.active ? $0 : nil }
-    default: nil
-    }
   }
 }

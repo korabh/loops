@@ -24,8 +24,8 @@ struct Composer<Status: View>: View {
         .font(.callout)
         .foregroundStyle(.secondary)
         .lineLimit(1)
-        .padding(.horizontal, 16)
-      HStack(alignment: .center, spacing: 8) {
+        .padding(.horizontal, 12)
+      HStack(spacing: 8) {
         TextField(prompt, text: $text, axis: .vertical)
           .textFieldStyle(.plain)
           .lineLimit(1...6)
@@ -40,8 +40,9 @@ struct Composer<Status: View>: View {
               }
             }
           } label: {
-            Image(icon: "ellipsis", size: 14)
+            Label { Text("More Ways to Send") } icon: { Image(icon: "ellipsis", size: 14) }
           }
+          .labelStyle(.iconOnly)
           .menuStyle(.borderlessButton)
           .menuIndicator(.hidden)
           .fixedSize()
@@ -51,9 +52,9 @@ struct Composer<Status: View>: View {
           ProgressView().controlSize(.small).frame(width: 26, height: 26)
         } else {
           Button(action: go) {
-            Image(icon: icon, size: 13)
-              .frame(width: 16, height: 16)
+            Label { Text(send) } icon: { Image(icon: icon, size: 13).frame(width: 16, height: 16) }
           }
+          .labelStyle(.iconOnly)
           .buttonStyle(.borderedProminent)
           .buttonBorderShape(.circle)
           .keyboardShortcut(.return, modifiers: .command)
@@ -61,18 +62,12 @@ struct Composer<Status: View>: View {
           .help("\(send) (⌘↩)")
         }
       }
-      .padding(.leading, 16)
-      .padding(.trailing, 7)
-      .padding(.vertical, 7)
-      .frame(minHeight: 40)
-      .glassEffect(.regular, in: .rect(cornerRadius: 20))
+      .padding(.horizontal, 12)
+      .padding(.vertical, 8)
+      .glassEffect()
       .onTapGesture { focused = true }
     }
-    .frame(maxWidth: 704)
-    .padding(.horizontal, 20)
-    .padding(.bottom, 14)
-    .padding(.top, 6)
-    .frame(maxWidth: .infinity)
+    .scenePadding()
   }
 
   private func go() {

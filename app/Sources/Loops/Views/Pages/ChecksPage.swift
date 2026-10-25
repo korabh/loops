@@ -71,6 +71,7 @@ struct ChecksPage: View {
       TableColumn("Title", value: \CheckLine.title) { r in Text(r.title).help(r.title) }
         .width(min: 160, ideal: 300)
         .customizationID("title")
+        .disabledCustomizationBehavior(.visibility)
       TableColumn("Workflow", value: \CheckLine.workflow).width(min: 70, ideal: 110)
         .customizationID("workflow")
       TableColumn("Branch", value: \CheckLine.branch) { r in Text(r.branch).truncationMode(.middle).foregroundStyle(.secondary).help(r.branch) }
@@ -80,6 +81,7 @@ struct ChecksPage: View {
         .customizationID("jobs")
       TableColumn("Runner", value: \CheckLine.runner) { r in Text(r.runner).foregroundStyle(.secondary) }.width(min: 50, ideal: 80)
         .customizationID("runner")
+        .defaultVisibility(.hidden)
       TableColumn("Started", value: \CheckLine.started) { r in
         Text(r.run.started.map { "\(Clock.short(store.now.timeIntervalSince($0))) ago" } ?? "").monospacedDigit().foregroundStyle(.secondary)
       }
@@ -105,20 +107,14 @@ struct ChecksPage: View {
     .focusedSceneValue(\.selected, Selected(urls: picked.map(\.url)))
     .overlay {
       if !ci.loaded {
-        ProgressView("Loading runners and runs")
+        EmptyState(loading: "Loading runners and runs")
       } else if rows.isEmpty {
         EmptyState(title: all.isEmpty ? "No Runs Yet" : "No Matching Runs", icon: "checkmark.seal")
       }
     }
-    .safeAreaInset(edge: .bottom, spacing: 0) {
-      VStack(spacing: 0) {
-        Divider()
-        RunnerBar()
-      }
-      .background(.bar)
-    }
-    .navigationTitle("Checks")
-    .navigationSubtitle(subtitle(all))
+    .bottomBar { RunnerBar() }
+    .pageTitle("Checks")
+    .viewTabs($show, Show.allCases) { $0.title }
     .toolbar {
       ToolbarItem(placement: .principal) {
         Picker("Show", selection: $show) {
@@ -128,6 +124,11 @@ struct ChecksPage: View {
         .labelsHidden()
       }
       ToolbarItem {
+        Button("Refresh", icon: "arrow.clockwise") { Task { await ci.refresh(store: store) } }
+          .help("Check GitHub for new runs and runner changes now")
+      }
+      ToolbarSpacer(.fixed)
+      ToolbarItem {
         Picker("Workflow", selection: $workflow) {
           Text("All Workflows").tag("")
           Divider()
@@ -135,10 +136,9 @@ struct ChecksPage: View {
         }
         .pickerStyle(.menu)
         .fixedSize()
+        .help("Show one workflow's runs")
       }
-      ToolbarItem {
-        Button("Refresh", icon: "arrow.clockwise") { Task { await ci.refresh(store: store) } }
-      }
+      ToolbarSpacer(.fixed)
       ToolbarItem { TableViewMenu() }
     }
     .task {
@@ -152,12 +152,6 @@ struct ChecksPage: View {
     ) { _ in
       Button("OK", role: .cancel) {}
     } message: { Text($0) }
-  }
-
-  private func subtitle(_ all: [CIRun]) -> String {
-    let running = all.filter(\.active).count
-    let failed = all.filter(\.failed).count
-    return [running > 0 ? "\(running) running" : nil, failed > 0 ? "\(failed) failed" : nil].compactMap { $0 }.joined(separator: " · ")
   }
 
   private func line(_ run: CIRun) -> CheckLine {
@@ -214,8 +208,15 @@ private struct RunnerBar: View {
       }
       ForEach(ci.runners) { runner in
         Menu {
-          Button(runner.pid == nil ? "Start" : "Restart", systemImage: "arrow.clockwise") { ci.restart(runner, store: store) }
-            .disabled(runner.service == nil)
+          if runner.loaded && runner.online {
+            Button("Stop…", systemImage: "stop") { ci.ask(.stop, [runner]) }
+          } else {
+            Button("Start…", systemImage: "play") { ci.ask(.start, [runner]) }
+              .disabled(runner.service == nil)
+            if runner.stoppable {
+              Button(runner.loaded ? "Stop…" : "Don't Start at Login…", systemImage: "stop") { ci.ask(.stop, [runner]) }
+            }
+          }
           Button("Show Log", systemImage: "doc.text.magnifyingglass") { ci.showLog(runner) }
             .disabled(runner.service == nil)
           if let url = runner.job?.url {
@@ -250,12 +251,10 @@ private struct RunnerBar: View {
         .fixedSize()
       }
     }
-    .padding(.horizontal, 16)
-    .padding(.vertical, 8)
   }
 
   private func status(_ r: Runner) -> String {
-    if !r.online { return r.pid == nil ? "stopped" : "offline" }
+    if !r.online { return r.pid != nil ? "offline" : r.atLogin && !r.loaded ? "stopped · starts at login" : "stopped" }
     guard r.busy else { return "idle" }
     return r.job.map { "busy · \($0.name)" } ?? "busy"
   }

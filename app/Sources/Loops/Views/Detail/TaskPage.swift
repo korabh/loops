@@ -5,12 +5,16 @@ struct TaskPage: View {
   @Environment(\.openURL) private var openURL
   let task: BgTask
   @State private var full = false
+  @State private var agents: [SubAgent] = []
+  @State private var loaded = Date.distantPast
 
   var body: some View {
     let phase = store.phase(task)
     let job = store.jobs.jobs[task.id]
     let plan = job?.plan ?? []
-    let agents = store.subAgents(task)
+    let pull = store.pull(of: task)
+    let file = store.transcript(task)
+    let stamp = "\(task.id)|\(task.state)|\(job?.updated.timeIntervalSince1970 ?? 0)|\(JobActivity.of(task.id).total)|\(store.now.timeIntervalSince1970)"
     Form {
       Section {
         Text(task.prompt)
@@ -73,7 +77,7 @@ struct TaskPage: View {
           Text(Briefs.attributed(answer)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
         }
       }
-      if let pr = store.pull(of: task) {
+      if let pr = pull {
         Section("Pull Request") {
           LabeledContent {
             HStack {
@@ -87,7 +91,7 @@ struct TaskPage: View {
         }
       }
       Section {
-        if let file = store.transcript(task) {
+        if let file {
           LabeledContent("Transcript") {
             Button(file.lastPathComponent) { NSWorkspace.shared.open(file) }.buttonStyle(.link)
           }
@@ -101,27 +105,31 @@ struct TaskPage: View {
     }
     .formStyle(.grouped)
     .safeAreaBar(edge: .bottom, spacing: 0) { composer(phase, job) }
-    .focusedSceneValue(\.selected, Selected(urls: store.pull(of: task).map { [$0.url] } ?? [], pulls: store.pull(of: task).map { [$0] } ?? [], tasks: [task]))
-    .navigationTitle(Store.short(task))
-    .navigationSubtitle(store.kind(of: task))
+    .focusedSceneValue(\.selected, Selected(urls: pull.map { [$0.url] } ?? [], pulls: pull.map { [$0] } ?? [], tasks: [task]))
+    .pageTitle(Store.short(task))
     .toolbar {
-      ToolbarSpacer(.flexible)
       ToolbarItem {
         Button("Open in Terminal", icon: "terminal") { store.attachTask(task) }
+          .help("Attach to this Claude Code session in Terminal")
       }
       ToolbarItem {
         if task.active {
           Button("Stop", icon: "stop", role: .destructive) { store.stopTask(task) }
+            .help("Stop this task")
         } else {
-          Button("Remove", icon: "trash", role: .destructive) {
-            store.removeTask(task)
-            store.page = .tasks
-          }
+          Button("Remove…", icon: "trash", role: .destructive) { Removals.shared.ask([task], in: store) }
+            .help("Remove this task from Claude Code")
         }
       }
     }
-    .onAppear { store.jobs.follow(task.id) }
-    .onDisappear { store.jobs.follow(nil) }
+    .task(id: task.id) { await store.jobs.following(task.id) }
+    .task(id: stamp) {
+      let wait = 1 - Date().timeIntervalSince(loaded)
+      if wait > 0 { try? await Task.sleep(for: .seconds(wait)) }
+      guard !Task.isCancelled else { return }
+      loaded = Date()
+      agents = await store.loadSubAgents(task)
+    }
   }
 
   private func composer(_ phase: TaskPhase, _ job: Job?) -> some View {
@@ -139,13 +147,13 @@ struct TaskPage: View {
         Text("Sending…")
       } else if let q = store.queued[task.stable] {
         HStack(spacing: 6) {
-          Image(icon: "clock", size: 12)
+          Image(icon: "clock", size: 12).accessibilityHidden(true)
           Text("Sends when Claude stops: \(q)")
           Button("Cancel") { store.unqueue(task) }.buttonStyle(.link)
         }
       } else if working {
         HStack(spacing: 6) {
-          WorkingIcon(symbol: Symbols.askClaude, size: 12)
+          WorkingIcon(symbol: Symbols.askClaude, size: 12).accessibilityHidden(true)
           Text(job?.current ?? job?.activity.last ?? task.recent.last ?? "Working")
         }
       }

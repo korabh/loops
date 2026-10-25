@@ -6,12 +6,13 @@ final class Workspace {
   static weak var current: Workspace?
 
   private(set) var projects: [Store] = []
+  let jobs = JobWatcher(configs: [])
   var selection: String? {
     didSet { UserDefaults.standard.set(selection, forKey: Self.selectionKey) }
   }
   var adding = false
-  var choosing = false
   var problem: String?
+  @ObservationIgnored var openWindow: OpenWindowAction?
   @ObservationIgnored private var server: HookServer?
 
   private static let selectionKey = "selectedProject"
@@ -29,6 +30,13 @@ final class Workspace {
     NotificationDelegate.shared.workspace = self
     listen()
     load()
+    NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) {
+      [weak self] _ in
+      MainActor.assumeIsolated {
+        guard let jobs = self?.jobs else { return }
+        Task { await jobs.reconcile(every: 60) }
+      }
+    }
     Task { [weak self] in
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(60))
@@ -38,18 +46,46 @@ final class Workspace {
     }
   }
 
-  var active: Store? { selection.flatMap(store) }
-  var focus: Store? { active ?? ordered.first }
-  var all: Bool { active == nil && projects.count > 1 }
+  var focus: Store? { selection.flatMap(store) ?? ordered.first }
   var ordered: [Store] { projects.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending } }
 
   func store(_ id: String?) -> Store? { projects.first { $0.id == id } }
 
-  func open(_ id: String, _ page: Page, inbox: String? = nil) {
+  func show(_ id: String, _ page: Page? = nil, inbox: String? = nil) {
     guard let s = store(id) else { return }
-    s.inboxSelection = inbox
-    s.page = page
+    if let page {
+      s.inboxSelection = inbox
+      s.page = page
+    }
     selection = id
+    ProjectTabs.joinNext()
+    openWindow?(value: id)
+    NSApp.activate()
+  }
+
+  func showAll() {
+    openWindow?(id: "all")
+    NSApp.activate()
+  }
+
+  func choose(then open: ((String) -> Void)? = nil) {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.prompt = "Add Project"
+    panel.message = "Choose a git repository whose loops this Mac runs."
+    NSApp.activate()
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    add(url, then: open)
+  }
+
+  static func status(_ stores: [Store]) -> String {
+    let running = stores.map(\.running.count).reduce(0, +)
+    let waiting = stores.map(\.inbox.count).reduce(0, +)
+    let parts = [running > 0 ? "\(running) running" : nil, waiting > 0 ? "\(waiting) waiting on you" : nil].compactMap { $0 }
+    if !parts.isEmpty { return parts.joined(separator: " · ") }
+    return stores.count == 1 ? stores[0].phase.label : "Nothing waiting"
   }
 
   static func registered() -> [String] {
@@ -67,17 +103,19 @@ final class Workspace {
     let wanted = Self.registered()
     migrate(wanted)
     var next = projects.filter { wanted.contains($0.id) }
+    for gone in projects where !wanted.contains(gone.id) { gone.stop() }
     for repo in wanted where !next.contains(where: { $0.id == repo }) {
-      let store = Store(repo: URL(fileURLWithPath: repo), defaults: Self.defaults(for: repo))
+      let store = Store(repo: URL(fileURLWithPath: repo), defaults: Self.defaults(for: repo), jobs: jobs)
       if let url = server?.url { store.useHooks(url) }
       next.append(store)
     }
     projects = next
+    jobs.watch(next.flatMap(\.configs))
     if let s = selection, store(s) == nil { selection = nil }
     if projects.count == 1 { selection = projects[0].id }
   }
 
-  func add(_ folder: URL) {
+  func add(_ folder: URL, then open: ((String) -> Void)? = nil) {
     guard !adding else { return }
     let repo = folder.standardizedFileURL
     guard FileManager.default.fileExists(atPath: repo.appending(path: ".git").path) else {
@@ -94,7 +132,13 @@ final class Workspace {
         return
       }
       load()
-      selection = Self.registered().first { $0 == repo.path } ?? selection
+      guard let added = Self.registered().first(where: { $0 == repo.path }) else { return }
+      if let open {
+        selection = added
+        open(added)
+      } else {
+        show(added)
+      }
     }
   }
 

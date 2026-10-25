@@ -83,9 +83,7 @@ struct OpenInboxIntent: AppIntent {
   @MainActor
   func perform() async throws -> some IntentResult {
     guard let store = Workspace.current?.focus else { throw IntentFailure.notReady }
-    store.page = .inbox
-    store.showWindow?()
-    NSApp.activate()
+    Workspace.current?.show(store.id, .inbox)
     return .result()
   }
 }
@@ -99,9 +97,7 @@ struct OpenLoopIntent: OpenIntent {
   @MainActor
   func perform() async throws -> some IntentResult {
     guard let store = Workspace.current?.focus else { throw IntentFailure.notReady }
-    store.page = .loop(target.id)
-    store.showWindow?()
-    NSApp.activate()
+    Workspace.current?.show(store.id, .loop(target.id))
     return .result()
   }
 }

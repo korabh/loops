@@ -82,10 +82,37 @@ struct Runner: Identifiable, Equatable {
   let busy: Bool
   var service: String?
   var loaded = false
+  var atLogin = false
   var pid: Int?
   var job: CIJob?
 
   var short: String { name.split(separator: "-").last.map { "Runner \($0)" } ?? name }
+  var stoppable: Bool { service != nil && (loaded || atLogin) }
+}
+
+struct RunnerRequest: Identifiable {
+  enum Op { case start, stop }
+
+  let op: Op
+  let runners: [Runner]
+
+  var id: String { "\(op)-\(runners.map(\.id))" }
+
+  var title: String {
+    let verb = op == .start ? "Start" : "Stop"
+    return runners.count == 1 ? "\(verb) \(runners[0].short)?" : "\(verb) \(runners.count) runners?"
+  }
+
+  var message: String {
+    switch op {
+    case .start:
+      "They take GitHub Actions jobs on this Mac, and start again at login, until you stop them here."
+    case .stop:
+      runners.contains(where: \.busy)
+        ? "A job running on them fails. They stay stopped, also after you log in, until you start them here."
+        : "They stay stopped, also after you log in, until you start them here."
+    }
+  }
 }
 
 @MainActor @Observable
@@ -96,6 +123,7 @@ final class CI {
   private(set) var loaded = false
   private(set) var mainSelfHosted = false
   private(set) var acting = Set<String>()
+  var request: RunnerRequest?
   private(set) var stale: [StaleRun] = []
   private(set) var cancelled = 0
   private(set) var cancelling = 0
@@ -108,8 +136,8 @@ final class CI {
   @ObservationIgnored private var generation = 0
   @ObservationIgnored private var refreshed: Date?
 
-  func refreshIfStale(store: Store) async {
-    if Date().timeIntervalSince(refreshed ?? .distantPast) > 45 { await refresh(store: store) }
+  func refreshIfStale(store: Store, after seconds: Double = 45) async {
+    if Date().timeIntervalSince(refreshed ?? .distantPast) > seconds { await refresh(store: store) }
   }
 
   func refresh(store: Store) async {
@@ -117,18 +145,20 @@ final class CI {
     let mine = generation
     refreshed = Date()
     let repo = store.paths.repo
-    async let r = Shell.exec(["gh", "api", "repos/{owner}/{repo}/actions/runners"], in: repo)
+    async let r = Shell.exec(["gh", "api", "repos/{owner}/{repo}/actions/runners"], in: repo, qos: .utility)
     async let l = Shell.exec(
       [
         "gh", "run", "list", "--limit", "100", "--json",
         "databaseId,workflowName,displayTitle,headBranch,event,status,conclusion,startedAt,updatedAt,url",
-      ], in: repo)
-    async let s = Shell.exec(["launchctl", "list"], in: repo)
+      ], in: repo, qos: .utility)
+    async let s = Shell.exec(["launchctl", "list"], in: repo, qos: .utility)
+    async let d = Shell.exec(["launchctl", "print-disabled", "gui/\(getuid())"], in: repo, qos: .utility)
     let workflow = store.project?.ci?.workflow ?? ""
-    async let w = Shell.exec(["git", "show", "origin/main:.github/workflows/\(workflow)"], in: repo)
+    async let w = Shell.exec(["git", "show", "origin/main:.github/workflows/\(workflow)"], in: repo, qos: .utility)
     let (rc, ro) = await r
     let (lc, lo) = await l
     let (_, so) = await s
+    let (_, dout) = await d
     let (wc, wo) = await w
     defer { loaded = true }
     mainSelfHosted = !workflow.isEmpty && wc == 0 && wo.contains("self-hosted")
@@ -149,6 +179,7 @@ final class CI {
     let shown = Set(next.flatMap { $0.jobs.map(\.id) })
     billed = billed.filter { shown.contains($0.key) }
     let services = Self.services(so)
+    let disabled = Self.disabled(dout)
     var found: [Runner] = []
     if rc == 0, let obj = (try? JSONSerialization.jsonObject(with: Data(ro.utf8))) as? [String: Any] {
       for x in obj["runners"] as? [[String: Any]] ?? [] {
@@ -161,6 +192,7 @@ final class CI {
         } else if let label = Self.installed().first(where: { $0.hasSuffix(".\(name)") }) {
           runner.service = label
         }
+        if let label = runner.service { runner.atLogin = !disabled.contains(label) }
         for run in next where run.active {
           if let job = run.jobs.first(where: { $0.runner == name && $0.status == "in_progress" }) { runner.job = job }
         }
@@ -176,13 +208,13 @@ final class CI {
   }
 
   private func jobs(_ run: Int, in repo: URL) async -> [CIJob]? {
-    let (code, out) = await Shell.exec(["gh", "api", "repos/{owner}/{repo}/actions/runs/\(run)/jobs"], in: repo)
+    let (code, out) = await Shell.exec(["gh", "api", "repos/{owner}/{repo}/actions/runs/\(run)/jobs"], in: repo, qos: .utility)
     guard code == 0 else { return nil }
     let jobs = Self.jobs(out)
     await withTaskGroup(of: (Int, Bool?).self) { group in
       for job in jobs where job.refused && billed[job.id] == nil {
         group.addTask {
-          let (c, o) = await Shell.exec(["gh", "api", "repos/{owner}/{repo}/check-runs/\(job.id)/annotations"], in: repo)
+          let (c, o) = await Shell.exec(["gh", "api", "repos/{owner}/{repo}/check-runs/\(job.id)/annotations"], in: repo, qos: .utility)
           return (job.id, c == 0 ? Self.billing(o) : nil)
         }
       }
@@ -246,6 +278,15 @@ final class CI {
     ((try? FileManager.default.contentsOfDirectory(atPath: agents.path)) ?? [])
       .filter { $0.hasPrefix("actions.runner.") && $0.hasSuffix(".plist") }
       .map { String($0.dropLast(6)) }
+  }
+
+  static func disabled(_ out: String) -> Set<String> {
+    Set(
+      out.split(separator: "\n").compactMap { line in
+        let parts = line.split(separator: "=>").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 2, parts[1] == "disabled" || parts[1] == "true" else { return nil }
+        return parts[0].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+      })
   }
 
   private static func services(_ out: String) -> [(label: String, pid: Int?)] {
@@ -350,14 +391,37 @@ final class CI {
     act("pr:\(pr.number)", store: store, ["gh", "pr", "update-branch", String(pr.number)])
   }
 
-  func restart(_ runner: Runner, store: Store) {
+  func ask(_ op: RunnerRequest.Op, _ runners: [Runner]) {
+    let eligible = runners.filter { op == .start ? $0.service != nil : $0.stoppable }
+    if !eligible.isEmpty { request = RunnerRequest(op: op, runners: eligible) }
+  }
+
+  func confirm(_ request: RunnerRequest, store: Store) {
+    self.request = nil
+    for runner in request.runners {
+      switch request.op {
+      case .start: start(runner, store: store)
+      case .stop: stop(runner, store: store)
+      }
+    }
+  }
+
+  private func start(_ runner: Runner, store: Store) {
     guard let service = runner.service else { return }
     let domain = "gui/\(getuid())"
-    var commands: [(label: String?, command: [String])] = []
+    var commands: [(label: String?, command: [String])] = [(nil, ["launchctl", "enable", "\(domain)/\(service)"])]
     if !runner.loaded {
       commands.append(("load \(runner.short)", ["launchctl", "bootstrap", domain, Self.agents.appending(path: "\(service).plist").path]))
     }
     commands.append(("start \(runner.short)", ["launchctl", "kickstart", "-k", "\(domain)/\(service)"]))
+    act("runner:\(runner.id)", store: store, commands, settle: 2)
+  }
+
+  private func stop(_ runner: Runner, store: Store) {
+    guard let service = runner.service else { return }
+    let domain = "gui/\(getuid())"
+    var commands: [(label: String?, command: [String])] = [("keep \(runner.short) stopped", ["launchctl", "disable", "\(domain)/\(service)"])]
+    if runner.loaded { commands.append(("stop \(runner.short)", ["launchctl", "bootout", "\(domain)/\(service)"])) }
     act("runner:\(runner.id)", store: store, commands, settle: 2)
   }
 
@@ -418,13 +482,13 @@ extension CI {
           at: board.blocked.last?.started, action: "Fix Billing"))
     }
     let down = offline
-    if !down.isEmpty, queued > 0 || down.count == runners.count {
+    if !down.isEmpty, queued > 0, down.count == runners.count {
       out.append(
         CIProblem(
           id: "runners", kind: .runners,
-          title: down.count == runners.count ? "\(plural(down.count, "runner")) offline" : "\(down.count) of \(runners.count) runners offline",
-          detail: queued > 0 ? "\(plural(queued, "run")) waiting for a runner" : "Checks can't run on this Mac",
-          at: nil, action: down.contains { $0.service != nil } ? (down.count == 1 ? "Start" : "Start All") : nil))
+          title: "\(plural(queued, "run")) waiting for a runner",
+          detail: down.count == 1 ? "\(down[0].short) is stopped" : "All \(down.count) runners are stopped",
+          at: nil, action: down.contains { $0.service != nil } ? (down.count == 1 ? "Start…" : "Start All…") : nil))
     }
     if !stale.isEmpty {
       out.append(
@@ -450,7 +514,7 @@ extension CI {
   func perform(_ p: CIProblem, store: Store) {
     switch p.kind {
     case .billing: openBilling(store: store)
-    case .runners: for r in offline where r.service != nil { restart(r, store: store) }
+    case .runners: ask(.start, offline)
     case .stale: cancelStale(store: store)
     case .stuck: updateBranches(stuckPulls(store: store), store: store)
     }

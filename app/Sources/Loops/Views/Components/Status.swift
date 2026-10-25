@@ -3,9 +3,10 @@ import SwiftUI
 
 private struct Pulsing: ViewModifier {
   @Environment(\.accessibilityReduceMotion) private var still
+  @Environment(\.appearsActive) private var active
 
   func body(content: Content) -> some View {
-    if still {
+    if still || !active {
       content
     } else {
       content.phaseAnimator([1.0, 0.3]) { view, opacity in
@@ -35,6 +36,7 @@ struct WorkingIcon: View {
 }
 
 struct StatusLabel: View {
+  @Environment(\.iconSize) private var size
   let title: String
   let symbol: String
   var tint: Color = .secondary
@@ -45,27 +47,45 @@ struct StatusLabel: View {
       Text(title)
     } icon: {
       if spinning, !symbol.isEmpty {
-        WorkingIcon(symbol: symbol)
+        WorkingIcon(symbol: symbol, size: size)
       } else if spinning {
         ProgressView().controlSize(.mini)
       } else {
-        Image(icon: symbol, size: 14).foregroundStyle(tint)
+        Image(icon: symbol, size: size).foregroundStyle(tint)
       }
     }
   }
 }
 
-struct EmptyState: View {
+struct EmptyState<Actions: View>: View {
   let title: String
-  let icon: String
+  var icon = ""
   var detail: String?
+  var loading = false
+  @ViewBuilder var actions: Actions
 
   var body: some View {
-    ContentUnavailableView {
-      Label { Text(title) } icon: { Image(icon: icon, size: 32) }
-    } description: {
-      if let detail { Text(detail) }
+    if loading {
+      ProgressView(title)
+    } else {
+      ContentUnavailableView {
+        Label { Text(title) } icon: { Image(icon: icon, size: 32) }
+      } description: {
+        if let detail { Text(detail) }
+      } actions: {
+        actions
+      }
     }
+  }
+}
+
+extension EmptyState where Actions == EmptyView {
+  init(title: String, icon: String, detail: String? = nil) {
+    self.init(title: title, icon: icon, detail: detail) { EmptyView() }
+  }
+
+  init(loading title: String) {
+    self.init(title: title, loading: true) { EmptyView() }
   }
 }
 
@@ -95,11 +115,12 @@ struct MergeButton: View {
     } else {
       Button(title) { confirming = true }
         .confirmationDialog("Merge #\(pr.number) into main?", isPresented: $confirming) {
-          Button("Merge") { store.merge(pr) }
+          Button("Merge", role: pr.oneWay ? .destructive : nil) { store.merge(pr) }
           Button("Cancel", role: .cancel) {}
         } message: {
           Text(pr.oneWay ? "\(pr.tidyTitle)\n\nOne-way door: hard to undo once merged." : pr.tidyTitle)
         }
+        .dialogSeverity(pr.oneWay ? .critical : .automatic)
     }
   }
 }
@@ -233,7 +254,7 @@ struct TaskMenu: View {
     }
     if let pr = store.pull(of: task) {
       if pr.open, store.mergeState(pr).mergeable {
-        Button("Merge #\(pr.number)", systemImage: "arrow.triangle.merge") { store.merge(pr) }
+        Button("Merge #\(pr.number)…", systemImage: "arrow.triangle.merge") { store.merges = [pr] }
           .disabled(store.merging.contains(pr.number))
       }
       Button("Open #\(pr.number) on GitHub", systemImage: "safari") { openURL(pr.url) }
@@ -243,7 +264,30 @@ struct TaskMenu: View {
     if task.active {
       Button("Stop", systemImage: "stop", role: .destructive) { store.stopTask(task) }
     } else {
-      Button("Remove", systemImage: "trash", role: .destructive) { store.removeTask(task) }
+      Button("Remove…", systemImage: "trash", role: .destructive) { Removals.shared.ask([task], in: store) }
     }
+  }
+}
+
+@MainActor @Observable
+final class Removals {
+  static let shared = Removals()
+
+  private(set) var pending: [String: [BgTask]] = [:]
+
+  func ask(_ tasks: [BgTask], in store: Store) {
+    let done = tasks.filter { !$0.active }
+    pending[store.id] = done.isEmpty ? nil : done
+  }
+
+  func tasks(_ store: Store) -> [BgTask] { pending[store.id] ?? [] }
+
+  func clear(_ store: Store) { pending[store.id] = nil }
+
+  func confirm(_ store: Store) {
+    let tasks = self.tasks(store)
+    clear(store)
+    tasks.forEach(store.removeTask)
+    if case .task(let id)? = store.page, tasks.contains(where: { $0.stable == id }) { store.page = .tasks }
   }
 }

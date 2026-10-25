@@ -17,18 +17,28 @@ struct LoopsApp: App {
   }
 
   var body: some Scene {
-    Window("Loops", id: "loops") {
-      WorkspaceWindow()
+    WindowGroup("Project", id: "project", for: String.self) { $id in
+      ProjectWindow(id: $id)
         .environment(workspace)
         .frame(minWidth: 900, minHeight: 560)
+    } defaultValue: {
+      Workspace.current?.focus?.id ?? ""
     }
     .defaultSize(width: 1240, height: 820)
     .defaultLaunchBehavior(.presented)
     .commands {
       LoopsCommands(workspace: workspace)
-      ActionCommands(workspace: workspace)
+      ActionCommands()
+      ViewCommands()
       TableCommands()
     }
+
+    Window("All Projects", id: "all") {
+      AllProjectsWindow()
+        .environment(workspace)
+        .frame(minWidth: 760, minHeight: 480)
+    }
+    .defaultSize(width: 1100, height: 760)
 
     MenuBarExtra {
       MenuBarMenu().environment(workspace)

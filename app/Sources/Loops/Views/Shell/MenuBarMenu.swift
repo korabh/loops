@@ -4,17 +4,16 @@ struct MenuBarMenu: View {
   @Environment(Workspace.self) private var workspace
   @Environment(\.openWindow) private var openWindow
 
-  private func show(_ store: Store, _ page: Page, inbox: String? = nil) {
-    workspace.open(store.id, page, inbox: inbox)
-    openWindow(id: "loops")
-    NSApp.activate()
+  private func show(_ store: Store, _ page: Page?, inbox: String? = nil) {
+    workspace.openWindow = openWindow
+    workspace.show(store.id, page, inbox: inbox)
   }
 
   var body: some View {
     let stores = workspace.ordered
     if stores.isEmpty {
       Button("Add Project…") {
-        openWindow(id: "loops")
+        openWindow(id: "project")
         NSApp.activate()
       }
     }
@@ -28,17 +27,21 @@ struct MenuBarMenu: View {
     Divider()
     if let store = workspace.focus {
       Button("New Task…") {
-        show(store, store.page ?? .home)
+        show(store, nil)
         store.composing = true
       }
       .keyboardShortcut("n")
+      Button("Open Loops") { show(store, nil) }
+        .keyboardShortcut("o")
     }
-    Button("Open Loops") {
-      openWindow(id: "loops")
-      NSApp.activate()
+    if stores.count > 1 {
+      Button("All Projects") {
+        workspace.openWindow = openWindow
+        workspace.showAll()
+      }
+      .keyboardShortcut("0")
     }
-    .keyboardShortcut("o")
-    Button("Refresh") { Task { for s in stores { await s.refresh() } } }
+    Button("Refresh") { Task { await withTaskGroup { g in for s in stores { g.addTask { await s.refreshAll() } } } } }
       .keyboardShortcut("r")
     Divider()
     SettingsLink { Text("Settings…") }
@@ -62,7 +65,7 @@ private struct ProjectMenu: View {
     if !inbox.isEmpty {
       Menu("Needs You (\(inbox.count))") {
         ForEach(inbox.prefix(8)) { row in
-          Button(row.title, systemImage: Self.symbol(row.kind)) { show(store, .inbox, row.id) }
+          Button(row.title, systemImage: row.kind.symbol) { show(store, .inbox, row.id) }
         }
         if inbox.count > 8 {
           Button("Show All \(inbox.count)") { show(store, .inbox, nil) }
@@ -93,63 +96,84 @@ private struct ProjectMenu: View {
     }
     Button("Open Runner in Terminal") { store.attach() }
   }
-
-  static func symbol(_ kind: InboxRow.Kind) -> String {
-    switch kind {
-    case .answer: "questionmark.bubble"
-    case .merge: "arrow.triangle.merge"
-    case .fix: "wrench.adjustable"
-    case .decide: "text.bubble"
-    case .checks: "exclamationmark.triangle"
-    }
-  }
 }
 
 struct LoopsCommands: Commands {
   let workspace: Workspace
+  @FocusedValue(\.project) private var focused
+  @Environment(\.openWindow) private var openWindow
+
+  private func reveal(_ store: Store, _ page: Page? = nil) {
+    if focused?.id == store.id {
+      if let page { store.page = page }
+      return
+    }
+    workspace.openWindow = openWindow
+    workspace.show(store.id, page)
+  }
 
   var body: some Commands {
-    let store = workspace.focus
+    let store = focused ?? workspace.focus
+    let projects = workspace.ordered
     SidebarCommands()
     InspectorCommands()
     CommandGroup(replacing: .newItem) {
-      Button("New Task…") { store?.composing = true }
-        .keyboardShortcut("n")
-        .disabled(store == nil)
-      Button("New Loop…") { store?.editing = .add }
-        .keyboardShortcut("n", modifiers: [.command, .shift])
-        .disabled(store == nil)
+      Button("New Task…") {
+        guard let store else { return }
+        reveal(store)
+        store.composing = true
+      }
+      .keyboardShortcut("n")
+      .disabled(store == nil)
+      Button("New Loop…") {
+        guard let store else { return }
+        reveal(store)
+        store.editing = .add
+      }
+      .keyboardShortcut("n", modifiers: [.command, .shift])
+      .disabled(store == nil)
+      Divider()
+      Button("Add Project…") { workspace.choose() }
+        .keyboardShortcut("o")
+        .disabled(workspace.adding)
+      Menu("Open Project") {
+        ForEach(Array(projects.enumerated()), id: \.element.id) { i, s in
+          Button {
+            workspace.openWindow = openWindow
+            workspace.show(s.id)
+          } label: {
+            Text(s.name)
+            Text(Workspace.status([s]))
+          }
+          .keyboardShortcut(i < 9 ? KeyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: [.command, .control]) : nil)
+        }
+      }
+      .disabled(projects.isEmpty)
     }
     CommandMenu("Go") {
       ForEach(Array(Page.top.enumerated()), id: \.offset) { i, page in
-        Button(page.title) { if let store { workspace.open(store.id, page) } }
+        Button(page.title) { if let store { reveal(store, page) } }
           .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")))
           .disabled(store == nil)
       }
-      if workspace.projects.count > 1 {
-        Divider()
-        Button("All Projects") { workspace.selection = nil }
+    }
+    CommandGroup(before: .windowList) {
+      if projects.count > 1 {
+        Button("All Projects") { openWindow(id: "all") }
           .keyboardShortcut("0")
-        ForEach(workspace.ordered, id: \.id) { s in
-          Button(s.name) { workspace.selection = s.id }
-        }
+        Divider()
       }
     }
     CommandGroup(after: .toolbar) {
       Button("Refresh") {
-        Task {
-          for s in workspace.projects {
-            await s.refresh()
-            await s.refreshSpend()
-          }
-        }
+        Task { await withTaskGroup { g in for s in workspace.projects { g.addTask { await s.refreshAll() } } } }
       }
       .keyboardShortcut("r")
     }
   }
 }
 
-struct Selected {
+struct Selected: Equatable {
   var urls: [URL] = []
   var pulls: [PullRequest] = []
   var loops: [String] = []
@@ -158,15 +182,15 @@ struct Selected {
 
 extension FocusedValues {
   @Entry var selected: Selected?
+  @Entry var project: Store?
 }
 
 struct ActionCommands: Commands {
-  let workspace: Workspace
   @FocusedValue(\.selected) private var selected
+  @FocusedValue(\.project) private var store
 
   var body: some Commands {
     let s = selected ?? Selected()
-    let store = workspace.focus
     let mergeable = store.map { st in s.pulls.filter { $0.open && st.mergeState($0).mergeable } } ?? []
     CommandMenu("Actions") {
       Button("Open on GitHub") { s.urls.forEach { NSWorkspace.shared.open($0) } }

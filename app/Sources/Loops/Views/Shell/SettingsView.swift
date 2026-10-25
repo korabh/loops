@@ -4,22 +4,21 @@ struct SettingsView: View {
   var body: some View {
     TabView {
       Tab {
-        GeneralSettings()
+        GeneralSettings().frame(width: 520, height: 160)
       } label: {
-        Label("General", icon: "gearshape")
+        Label("General", icon: "gearshape", size: 20)
       }
       Tab {
-        ProjectSettings()
+        ProjectSettings().frame(width: 600, height: 520)
       } label: {
-        Label("Projects", icon: "folder")
+        Label("Projects", icon: "folder", size: 20)
       }
       Tab {
-        AccountSettings()
+        AccountSettings().frame(width: 600, height: 460)
       } label: {
-        Label("Accounts", icon: "person.crop.circle")
+        Label("Accounts", icon: "person.crop.circle", size: 20)
       }
     }
-    .frame(width: 600, height: 520)
   }
 }
 
@@ -191,10 +190,16 @@ private struct AccountRow: Identifiable {
 private struct AccountSettings: View {
   @Environment(Workspace.self) private var workspace
   @State private var removing: AccountRow?
+  @State private var registered: [String] = []
+  @State private var profiles: [String: AccountProfile] = [:]
+
+  private var known: [(Store, RunnerState.Account)] {
+    workspace.ordered.flatMap { s in (s.runner?.accounts ?? []).map { (s, $0) } }
+  }
 
   private var rows: [AccountRow] {
-    let known = workspace.ordered.flatMap { s in (s.runner?.accounts ?? []).map { (s, $0) } }
-    let dirs = Array(Set(known.map(\.1.dir) + (Registry.read()?.accounts ?? []))).sorted()
+    let known = known
+    let dirs = Array(Set(known.map(\.1.dir) + registered)).sorted()
     return dirs.map { dir in
       let owner = known.first { $0.1.dir == dir && $0.1.own == true }?.0
       let account = known.first { $0.1.dir == dir && $0.1.limitedAt != nil }?.1 ?? known.first { $0.1.dir == dir }?.1
@@ -204,11 +209,12 @@ private struct AccountSettings: View {
 
   var body: some View {
     let stores = workspace.ordered
+    let dirs = known.map(\.1.dir)
     Form {
       Problems()
       Section {
         ForEach(rows) { row in
-          let profile = AccountProfile.read(row.dir)
+          let profile = profiles[row.dir]
           LabeledContent {
             HStack {
               if let limit = limit(row.account) { Text(limit).foregroundStyle(.orange) }
@@ -248,8 +254,17 @@ private struct AccountSettings: View {
       }
     }
     .formStyle(.grouped)
+    .task(id: dirs + stores.map { $0.action ?? "" }) {
+      let (accounts, found) = await Task.detached {
+        let accounts = Registry.read()?.accounts ?? []
+        let found = Set(dirs + accounts).reduce(into: [String: AccountProfile]()) { out, dir in out[dir] = AccountProfile.read(dir) }
+        return (accounts, found)
+      }.value
+      registered = accounts
+      profiles = found
+    }
     .confirmationDialog(
-      removing.map { "Remove \(AccountProfile.read($0.dir)?.email ?? $0.dir)?" } ?? "",
+      removing.map { "Remove \(profiles[$0.dir]?.email ?? $0.dir)?" } ?? "",
       isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
       presenting: removing
     ) { row in

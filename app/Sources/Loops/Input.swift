@@ -22,15 +22,20 @@ struct PendingInput: Equatable {
     }
   }
 
-  nonisolated(unsafe) private static var cache: [String: (Int, PendingInput?)] = [:]
+  nonisolated(unsafe) private static var cache: [String: (size: Int, found: PendingInput?, used: Date)] = [:]
   private static let lock = NSLock()
 
   static func read(_ url: URL, waitingFor: String?) -> PendingInput? {
     let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int) ?? 0
     guard size > 0 else { return nil }
-    lock.lock()
-    defer { lock.unlock() }
-    if let hit = cache[url.path], hit.0 == size { return hit.1 }
+    let now = Date()
+    let hit = lock.withLock { () -> PendingInput?? in
+      if cache.count > 32 { cache = cache.filter { now.timeIntervalSince($0.value.used) < 3600 } }
+      guard let hit = cache[url.path], hit.size == size else { return nil }
+      cache[url.path]?.used = now
+      return .some(hit.found)
+    }
+    if let hit { return hit }
     guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
     defer { try? h.close() }
     try? h.seek(toOffset: size > 512 * 1024 ? UInt64(size - 512 * 1024) : 0)
@@ -57,7 +62,7 @@ struct PendingInput: Equatable {
       }
     }
     let found = calls.last { !answered.contains($0.id) }.map(describe) ?? said.map(question)
-    cache[url.path] = (size, found)
+    lock.withLock { cache[url.path] = (size, found, now) }
     return found
   }
 
@@ -197,7 +202,7 @@ extension Store {
     guard let sid = t.sessionId, let cwd = t.cwd, !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
     let key = "reply:\(t.id)"
     let question = t.needsYou ? pendingInput(t)?.title ?? t.waitingFor.map { "It is waiting for \($0)" } ?? "" : nil
-    asking.insert(key)
+    if !asking.contains(key) { asking.insert(key) }
     notice = nil
     let dir = URL(fileURLWithPath: cwd)
     Task {
@@ -243,7 +248,38 @@ extension Store {
 
   func pendingInput(_ t: BgTask) -> PendingInput? {
     guard t.needsYou else { return nil }
-    if let url = transcript(t), let found = PendingInput.read(url, waitingFor: t.waitingFor) { return found }
-    return Suggester.shared.screens[t.id] ?? t.waitingFor.map { PendingInput(title: "It is waiting for \($0)", detail: nil, options: []) }
+    if let hit = inputs[t.id] { return hit }
+    if !checked.contains(t.id), let url = transcript(t), let found = PendingInput.read(url, waitingFor: t.waitingFor) { return found }
+    return fallback(t)
+  }
+
+  func shownInput(_ t: BgTask) -> PendingInput? {
+    guard t.needsYou else { return nil }
+    return inputs[t.id] ?? fallback(t)
+  }
+
+  private func fallback(_ t: BgTask) -> PendingInput? {
+    Suggester.shared.screens[t.id] ?? t.waitingFor.map { PendingInput(title: "It is waiting for \($0)", detail: nil, options: []) }
+  }
+
+  func loadInputs() {
+    Task { await inputFlight.run { await self.readInputs() } }
+  }
+
+  private func readInputs() async {
+    let configs = configs
+    let wanted = needsInput.map { t in (id: t.id, path: jobs.jobs[t.id]?.transcript, session: t.sessionId, cwd: t.cwd, waiting: t.waitingFor) }
+    let found = await Task.detached(priority: .utility) {
+      var out: [String: PendingInput] = [:]
+      for w in wanted {
+        guard let url = Store.transcript(path: w.path, session: w.session, cwd: w.cwd, configs: configs),
+          let input = PendingInput.read(url, waitingFor: w.waiting)
+        else { continue }
+        out[w.id] = input
+      }
+      return out
+    }.value
+    checked = Set(wanted.map(\.id))
+    update(\.inputs, found)
   }
 }
