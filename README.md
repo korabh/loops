@@ -4,7 +4,7 @@ Recurring Claude Code agents that keep a repo moving while you work on something
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-  <img alt="Loops.app showing a project's Home: what needs you, the loops running now, and what runs next" src="docs/screenshot-light.png">
+  <img alt="Loops.app with two projects open as tabs, showing a project's Home: what needs you, the loops running now, and what runs next" src="docs/screenshot-light.png">
 </picture>
 
 Loops is two Claude Code plugins and a macOS menu bar app:
