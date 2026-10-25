@@ -11,6 +11,7 @@ final class Workspace {
     didSet { UserDefaults.standard.set(selection, forKey: Self.selectionKey) }
   }
   var adding = false
+  private(set) var shown: [String: Int] = [:]
   var problem: String?
   @ObservationIgnored var openWindow: OpenWindowAction?
   @ObservationIgnored private var server: HookServer?
@@ -28,8 +29,17 @@ final class Workspace {
     selection = UserDefaults.standard.string(forKey: Self.selectionKey)
     Workspace.current = self
     NotificationDelegate.shared.workspace = self
+    JobActivity.restore()
+    Spend.restore()
     listen()
     load()
+    NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) {
+      [weak self] _ in
+      MainActor.assumeIsolated {
+        JobActivity.save(keeping: Set(self?.projects.flatMap { $0.tasks.map(\.id) } ?? []))
+        Spend.persist(force: true)
+      }
+    }
     NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) {
       [weak self] _ in
       MainActor.assumeIsolated {
@@ -50,6 +60,13 @@ final class Workspace {
   var ordered: [Store] { projects.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending } }
 
   func store(_ id: String?) -> Store? { projects.first { $0.id == id } }
+
+  func appeared(_ id: String) { shown[id, default: 0] += 1 }
+
+  func disappeared(_ id: String) {
+    guard let n = shown[id] else { return }
+    shown[id] = n > 1 ? n - 1 : nil
+  }
 
   func show(_ id: String, _ page: Page? = nil, inbox: String? = nil) {
     guard let s = store(id) else { return }

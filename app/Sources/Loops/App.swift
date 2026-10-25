@@ -22,7 +22,7 @@ struct LoopsApp: App {
         .environment(workspace)
         .frame(minWidth: 900, minHeight: 560)
     } defaultValue: {
-      Workspace.current?.focus?.id ?? ""
+      Workspace.current.map { $0.shown.isEmpty ? $0.focus?.id ?? "" : "" } ?? ""
     }
     .defaultSize(width: 1240, height: 820)
     .defaultLaunchBehavior(.presented)

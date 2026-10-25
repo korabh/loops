@@ -26,6 +26,10 @@ final class JobSteps {
   private(set) var list: [String] = []
   private(set) var total = 0
 
+  func seed(_ steps: [String]) {
+    if list.isEmpty { list = Array(steps.suffix(8)) }
+  }
+
   func add(_ steps: [String], reset: Bool) {
     let next = Array(((reset ? [] : list) + steps).suffix(8))
     if next != list { list = next }
@@ -46,6 +50,15 @@ enum JobActivity {
 
   static func drop(_ ids: some Sequence<String>) {
     for id in ids { byId[id] = nil }
+  }
+
+  static func save(keeping ids: Set<String>, to defaults: UserDefaults = .standard) {
+    defaults.set(byId.filter { ids.contains($0.key) && !$0.value.list.isEmpty }.mapValues(\.list), forKey: "jobSteps")
+  }
+
+  static func restore(from defaults: UserDefaults = .standard) {
+    guard let saved = defaults.dictionary(forKey: "jobSteps") as? [String: [String]] else { return }
+    for (id, steps) in saved { of(id).seed(steps) }
   }
 }
 

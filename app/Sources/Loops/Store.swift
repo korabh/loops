@@ -268,6 +268,7 @@ final class Store {
   @ObservationIgnored var numbers: [String: (links: [String], answer: String?, found: [Int])] = [:]
   @ObservationIgnored private var hasScript: Bool?
   @ObservationIgnored let saver: Saver
+  @ObservationIgnored private var snapshotAt = Date.distantPast
   @ObservationIgnored let runnerFlight = Flight()
   @ObservationIgnored let githubFlight = Flight()
   @ObservationIgnored let liveFlight = Flight()
@@ -328,12 +329,17 @@ final class Store {
       })
     observers.append(
       center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-        MainActor.assumeIsolated { self?.saver.flush() }
+        MainActor.assumeIsolated {
+          self?.saver.flush()
+          self?.saveSpend(now: true)
+        }
       })
     DispatchQueue.main.async { [weak self, appearance] in
       NSApp.appearance = appearance.nsAppearance
       self?.trackBadge()
     }
+    runner = defaults.string(forKey: "runnerState").flatMap { try? JSONDecoder().decode(RunnerState.self, from: Data($0.utf8)) }
+    restoreSpend()
     followJobs()
     rebuildInbox()
     ran[.spend] = Date().addingTimeInterval(30 - interval(.spend))
@@ -544,6 +550,7 @@ final class Store {
     let keyed = self.tasks.compactMap { t in t.sessionId.flatMap { sid in t.cwd.map { (id: t.stable, session: sid, cwd: $0) } } }
     let (report, spent) = await Task.detached(priority: .utility) {
       let report = Spend.report(configs: configs, runner: runner, tasks: tasks, now: Date())
+      Spend.persist()
       var spent: [String: Tokens] = [:]
       for t in keyed {
         let total = configs.map { Spend.agent(URL(fileURLWithPath: $0).appending(path: "projects/\(Spend.slug(t.cwd))/\(t.session).jsonl")).tokens }
@@ -552,11 +559,39 @@ final class Store {
       }
       return (report, spent)
     }.value
+    let changed = report != spend || spent != spentByTask
     if report != spend {
       spend = report
       runsByLoop = Dictionary(grouping: report.runs, by: \.loop)
     }
     update(\.spentByTask, spent)
+    if changed, Date().timeIntervalSince(snapshotAt) >= 300 { saveSpend() }
+  }
+
+  private struct SpendSnapshot: Codable {
+    var report: SpendReport
+    var spent: [String: Tokens]
+  }
+
+  private var snapshotURL: URL { Spend.caches.appending(path: "projects/\(Spend.slug(paths.repo.path)).json") }
+
+  private func saveSpend(now: Bool = false) {
+    guard spend.loaded else { return }
+    snapshotAt = Date()
+    guard let data = try? JSONEncoder().encode(SpendSnapshot(report: spend, spent: spentByTask)) else { return }
+    let url = snapshotURL
+    let write = {
+      try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+      try? data.write(to: url, options: .atomic)
+    }
+    if now { write() } else { Task.detached(priority: .utility) { write() } }
+  }
+
+  private func restoreSpend() {
+    guard let data = try? Data(contentsOf: snapshotURL), let saved = try? JSONDecoder().decode(SpendSnapshot.self, from: data) else { return }
+    spend = saved.report
+    runsByLoop = Dictionary(grouping: saved.report.runs, by: \.loop)
+    spentByTask = saved.spent
   }
 
   func taskSpend(_ t: BgTask) -> Tokens? { spentByTask[t.stable] }
@@ -748,7 +783,7 @@ final class Store {
     let (code, out) = await Shell.run(script, ["state"], in: paths.repo, qos: .utility)
     let json = out.split(separator: "\n").last.map(String.init) ?? ""
     if code == 0, let s = try? JSONDecoder().decode(RunnerState.self, from: Data(json.utf8)) {
-      update(\.runner, s)
+      if update(\.runner, s) { defaults.set(json, forKey: "runnerState") }
       update(\.runnerProblem, nil)
       let runner = paths.runner
       let job = s.session?.id.flatMap { jobs.jobs[$0] }

@@ -9,32 +9,78 @@ struct ProjectWindow: View {
     Group {
       if let store = workspace.store(id) {
         LoopsWindow().environment(store).id(store.id)
+          .onAppear { workspace.appeared(store.id) }
+          .onDisappear { workspace.disappeared(store.id) }
       } else {
-        NoProjects { id = $0 }
+        ProjectChooser { id = $0 }
       }
     }
     .background(ProjectTabbing { if workspace.store(id) != nil { workspace.selection = id } })
-    .onAppear {
-      workspace.openWindow = openWindow
-      adopt()
-    }
-    .onChange(of: workspace.projects.map(\.id)) { adopt() }
-  }
-
-  private func adopt() {
-    if workspace.store(id) == nil, let s = workspace.focus { id = s.id }
+    .onAppear { workspace.openWindow = openWindow }
   }
 }
 
-private struct NoProjects: View {
+private struct ProjectChooser: View {
   @Environment(Workspace.self) private var workspace
-  let adopt: (String) -> Void
+  @Environment(\.dismiss) private var dismiss
+  let open: (String) -> Void
 
   var body: some View {
-    EmptyState(title: "No Projects", icon: "folder", detail: workspace.problem ?? "Add a git repository whose loops this Mac runs.") {
-      Button("Add Project…") { workspace.choose(then: adopt) }
-        .disabled(workspace.adding)
+    if workspace.projects.isEmpty {
+      EmptyState(title: "No Projects", icon: "folder", detail: workspace.problem ?? "Add a git repository whose loops this Mac runs.") {
+        Button("Add Project…") { workspace.choose(then: open) }
+          .disabled(workspace.adding)
+      }
+      .navigationTitle("Projects")
+    } else {
+      let closed = workspace.ordered.filter { workspace.shown[$0.id] == nil }
+      let opened = workspace.ordered.filter { workspace.shown[$0.id] != nil }
+      Form {
+        if !closed.isEmpty {
+          Section("Open a Project") {
+            ForEach(closed, id: \.id) { s in ProjectRow(store: s) { open(s.id) } }
+          }
+        }
+        if !opened.isEmpty {
+          Section("Already Open") {
+            ForEach(opened, id: \.id) { s in
+              ProjectRow(store: s) {
+                workspace.show(s.id)
+                dismiss()
+              }
+            }
+          }
+        }
+        Section {
+          HStack {
+            if let problem = workspace.problem { Text(problem).foregroundStyle(.secondary) }
+            Spacer()
+            Button("Add Project…") { workspace.choose(then: open) }
+              .disabled(workspace.adding)
+          }
+        }
+      }
+      .formStyle(.grouped)
+      .navigationTitle("Projects")
     }
+  }
+}
+
+private struct ProjectRow: View {
+  let store: Store
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      LabeledContent {
+        Text(Workspace.status([store])).foregroundStyle(.secondary)
+      } label: {
+        Text(store.name)
+        Text(store.paths.repo.path).truncationMode(.middle)
+      }
+      .contentShape(.rect)
+    }
+    .buttonStyle(.plain)
   }
 }
 
@@ -86,6 +132,9 @@ struct AllProjectsWindow: View {
       page = old
     }
     .onAppear { workspace.openWindow = openWindow }
+    .background {
+      ForEach(workspace.projects, id: \.id) { s in Color.clear.tracksVisibility(of: s) }
+    }
     .task { for s in workspace.projects { await s.refresh() } }
   }
 }

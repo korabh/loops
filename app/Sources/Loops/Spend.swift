@@ -1,6 +1,6 @@
 import Foundation
 
-struct Tokens: Equatable {
+struct Tokens: Codable, Equatable {
   var input = 0
   var output = 0
   var cacheWrite = 0
@@ -106,7 +106,7 @@ enum Price {
   }
 }
 
-struct Output: Equatable {
+struct Output: Codable, Equatable {
   let what: String
   let tokens: Int
   let later: Int
@@ -114,7 +114,7 @@ struct Output: Equatable {
   let file: Bool
 }
 
-struct AgentStat: Equatable {
+struct AgentStat: Codable, Equatable {
   var tokens = Tokens()
   var days: [String: Tokens] = [:]
   var turns = 0
@@ -131,7 +131,7 @@ struct AgentStat: Equatable {
   var limited = false
 }
 
-struct RunStat: Identifiable, Equatable {
+struct RunStat: Identifiable, Codable, Equatable {
   let id: String
   let loop: String
   var at: Date
@@ -175,7 +175,7 @@ struct RunStat: Identifiable, Equatable {
   }
 }
 
-struct SpendReport: Equatable {
+struct SpendReport: Codable, Equatable {
   var loaded = false
   var today = Tokens()
   var yesterday = Tokens()
@@ -437,6 +437,94 @@ enum Spend {
       t.loop = found
     }
     return found
+  }
+
+  private struct Saved: Codable {
+    struct Entry: Codable {
+      var offset: Int
+      var headed: Bool
+      var loop: String?
+      var first: Date?
+      var last: Date?
+      var model: String
+      var acted: Bool
+      var limited: Bool
+      var billed: Double?
+      var process: Int?
+      var stat: AgentStat
+    }
+
+    struct Measured: Codable {
+      var size: Int
+      var modified: Date
+      var process: Int?
+      var billed: Double?
+      var mine: Double
+    }
+
+    var version = 1
+    var transcripts: [String: Entry] = [:]
+    var samples: [String: Measured] = [:]
+  }
+
+  nonisolated(unsafe) static var caches = (FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first ?? FileManager.default.temporaryDirectory)
+    .appending(path: Bundle.main.bundleIdentifier ?? "Loops")
+  nonisolated(unsafe) private static var savedAt = Date.distantPast
+
+  static func persist(force: Bool = false) {
+    let now = Date()
+    let saved: Saved? = lock.withLock {
+      guard force || now.timeIntervalSince(savedAt) >= 300 else { return nil }
+      savedAt = now
+      var out = Saved()
+      for (path, t) in cache {
+        t.lock.lock()
+        if t.quiet {
+          out.transcripts[path] = Saved.Entry(
+            offset: t.offset, headed: t.headed, loop: t.loop, first: t.first, last: t.last, model: t.model, acted: t.acted,
+            limited: t.limited, billed: t.billed, process: t.process, stat: t.stat)
+        }
+        t.lock.unlock()
+      }
+      for (path, m) in samples {
+        out.samples[path] = Saved.Measured(
+          size: m.size, modified: m.modified, process: m.sample.process, billed: m.sample.billed, mine: m.sample.mine)
+      }
+      return out
+    }
+    guard let saved, let data = try? JSONEncoder().encode(saved) else { return }
+    try? FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+    try? data.write(to: caches.appending(path: "spend.json"), options: .atomic)
+  }
+
+  static func restore() {
+    guard let data = try? Data(contentsOf: caches.appending(path: "spend.json")),
+      let saved = try? JSONDecoder().decode(Saved.self, from: data), saved.version == 1
+    else { return }
+    let now = Date()
+    lock.withLock {
+      for (path, e) in saved.transcripts where cache[path] == nil {
+        let t = Transcript()
+        t.offset = e.offset
+        t.quiet = true
+        t.headed = e.headed
+        t.loop = e.loop
+        t.first = e.first
+        t.last = e.last
+        t.model = e.model
+        t.acted = e.acted
+        t.limited = e.limited
+        t.billed = e.billed
+        t.process = e.process
+        t.stat = e.stat
+        t.used = now
+        cache[path] = t
+      }
+      for (path, m) in saved.samples where samples[path] == nil {
+        samples[path] = (m.size, m.modified, Sample(process: m.process, billed: m.billed, mine: m.mine), now)
+      }
+      savedAt = now
+    }
   }
 
   private static func sweep(_ now: Date) {
