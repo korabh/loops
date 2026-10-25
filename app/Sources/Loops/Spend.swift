@@ -471,6 +471,18 @@ enum Spend {
     .appending(path: Bundle.main.bundleIdentifier ?? "Loops")
   nonisolated(unsafe) private static var savedAt = Date.distantPast
 
+  static var encoder: JSONEncoder {
+    let e = JSONEncoder()
+    e.nonConformingFloatEncodingStrategy = .convertToString(positiveInfinity: "inf", negativeInfinity: "-inf", nan: "nan")
+    return e
+  }
+
+  static var decoder: JSONDecoder {
+    let d = JSONDecoder()
+    d.nonConformingFloatDecodingStrategy = .convertFromString(positiveInfinity: "inf", negativeInfinity: "-inf", nan: "nan")
+    return d
+  }
+
   static func persist(force: Bool = false) {
     let now = Date()
     let saved: Saved? = lock.withLock {
@@ -492,14 +504,14 @@ enum Spend {
       }
       return out
     }
-    guard let saved, let data = try? JSONEncoder().encode(saved) else { return }
+    guard let saved, let data = try? encoder.encode(saved) else { return }
     try? FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
     try? data.write(to: caches.appending(path: "spend.json"), options: .atomic)
   }
 
   static func restore() {
     guard let data = try? Data(contentsOf: caches.appending(path: "spend.json")),
-      let saved = try? JSONDecoder().decode(Saved.self, from: data), saved.version == 1
+      let saved = try? decoder.decode(Saved.self, from: data), saved.version == 1
     else { return }
     let now = Date()
     lock.withLock {

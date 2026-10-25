@@ -578,7 +578,7 @@ final class Store {
   private func saveSpend(now: Bool = false) {
     guard spend.loaded else { return }
     snapshotAt = Date()
-    guard let data = try? JSONEncoder().encode(SpendSnapshot(report: spend, spent: spentByTask)) else { return }
+    guard let data = try? Spend.encoder.encode(SpendSnapshot(report: spend, spent: spentByTask)) else { return }
     let url = snapshotURL
     let write = {
       try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -588,7 +588,7 @@ final class Store {
   }
 
   private func restoreSpend() {
-    guard let data = try? Data(contentsOf: snapshotURL), let saved = try? JSONDecoder().decode(SpendSnapshot.self, from: data) else { return }
+    guard let data = try? Data(contentsOf: snapshotURL), let saved = try? Spend.decoder.decode(SpendSnapshot.self, from: data) else { return }
     spend = saved.report
     runsByLoop = Dictionary(grouping: saved.report.runs, by: \.loop)
     spentByTask = saved.spent

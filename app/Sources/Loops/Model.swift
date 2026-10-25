@@ -44,6 +44,15 @@ struct Ask: Identifiable, Hashable {
   let text: String
   let url: URL?
   let at: Date
+  var choices: [URL] = []
+
+  var options: [(label: String, url: URL)] {
+    choices.enumerated().map { i, u in
+      let q = URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "q" }?.value ?? ""
+      let words = q.split(separator: " ").drop { $0.hasPrefix("/") }.joined(separator: " ")
+      return (words.isEmpty ? "Option \(i + 1)" : words.prefix(1).uppercased() + words.dropFirst(), u)
+    }
+  }
 }
 
 struct RunnerState: Decodable, Equatable {

@@ -82,3 +82,15 @@ private func size(_ url: URL) -> Int {
     #expect(JobActivity.of(gone).list.isEmpty)
   }
 }
+
+@Suite struct SpendSnapshotEncoding {
+  @Test func aReportWithANonFiniteFactorStillSaves() throws {
+    var report = SpendReport(loaded: true)
+    report.factor = .infinity
+    report.runs = [RunStat(id: "r", loop: "loop-a", at: Date(), end: Date(), fixed: .nan)]
+    let data = try Spend.encoder.encode(report)
+    let back = try Spend.decoder.decode(SpendReport.self, from: data)
+    #expect(back.factor == .infinity)
+    #expect(back.runs.first?.fixed.isNaN == true)
+  }
+}

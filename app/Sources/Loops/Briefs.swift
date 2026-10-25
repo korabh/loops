@@ -228,7 +228,7 @@ enum Briefs {
   }
 
   private static func clean(_ s: some StringProtocol) -> String {
-    s.trimmingCharacters(in: CharacterSet(charactersIn: " ;:,-\t"))
+    s.trimmingCharacters(in: CharacterSet(charactersIn: " ;:,-\t·•|"))
   }
 
   private static func afterMarker(_ s: Substring) -> Substring {
@@ -251,11 +251,17 @@ enum Briefs {
         continue
       }
       var start = line.startIndex
+      let first = out.count
       for r in urls {
         let text = clean(afterMarker(line[start..<r.lowerBound]))
-        if !text.isEmpty {
-          out.append(
-            Ask(id: "\(b.loop)|\(text)", loop: b.loop, text: text, url: URL(string: trimmed(String(line[r]))), at: b.at))
+        let url = URL(string: trimmed(String(line[r])))
+        if !text.contains(where: { $0.isLetter || $0.isNumber }) {
+          if out.count > first, let url {
+            if out[out.count - 1].choices.isEmpty, let lead = out[out.count - 1].url { out[out.count - 1].choices = [lead] }
+            out[out.count - 1].choices.append(url)
+          }
+        } else {
+          out.append(Ask(id: "\(b.loop)|\(text)", loop: b.loop, text: text, url: url, at: b.at))
         }
         start = r.upperBound
       }

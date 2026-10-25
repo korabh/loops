@@ -204,3 +204,23 @@ private func problem(_ id: String) -> InboxRow {
     #expect(Wait.asked(asks, briefs: briefs) == [asks[0].id: now.addingTimeInterval(-2 * 3600)])
   }
 }
+
+@Suite struct PickOneAsks {
+  @Test func linksSeparatedOnlyByDotsAreChoicesOfOneDecision() {
+    let line =
+      "Page https://claude.ai/artifact/abc (ideas.md published beside it). Needs a person, pick one: claude-cli://open?repo=o/r&q=%2Floop-ux-explore%20pick%201 · claude-cli://open?repo=o/r&q=%2Floop-ux-explore%20pick%202 · claude-cli://open?repo=o/r&q=%2Floop-ux-explore%20pick%203"
+    let asks = Briefs.asks(Brief(id: 0, at: Date(), loop: "loop-ux-explore", text: "Nine friction points.\n" + line))
+    #expect(asks.count == 1)
+    #expect(asks.first?.text.hasPrefix("Page") == true)
+    let labels = asks.first?.options.map { $0.label }
+    #expect(labels == ["Pick 1", "Pick 2", "Pick 3"])
+  }
+
+  @Test func linksWithTheirOwnTextStaySeparateDecisions() {
+    let line = "- Decision: rename it claude-cli://open?q=%2Floop-a%20rename · or keep it claude-cli://open?q=%2Floop-a%20keep"
+    let asks = Briefs.asks(Brief(id: 0, at: Date(), loop: "loop-a", text: line))
+    let texts = asks.map { $0.text }
+    #expect(texts == ["rename it", "or keep it"])
+    #expect(asks.allSatisfy { $0.choices.isEmpty })
+  }
+}

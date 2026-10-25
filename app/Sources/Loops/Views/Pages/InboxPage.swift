@@ -163,7 +163,11 @@ private struct InboxMenu: View {
       }
       Button("Ask Claude Code", systemImage: "sparkles") { store.askClaude(item) }
         .disabled(store.asking.contains(item.id))
-      if let u = item.claude {
+      if !item.options.isEmpty {
+        ForEach(item.options, id: \.url) { o in
+          Button("\(o.label) in Terminal", systemImage: "terminal") { openURL(o.url) }
+        }
+      } else if let u = item.claude {
         Button("Open in Terminal", systemImage: "terminal") { openURL(u) }
       }
       if let loop = row.loop {
@@ -270,7 +274,14 @@ private struct InboxDetail: View {
         HStack {
           Button("Hide") { store.hide(item, undo: undo) }
           Spacer()
-          if let u = item.claude { Button("Open in Terminal") { openURL(u) } }
+          if !item.options.isEmpty {
+            ForEach(item.options, id: \.url) { o in
+              Button(o.label) { openURL(o.url) }
+                .help("Open Claude Code in Terminal with \u{201C}\(o.label.lowercased())\u{201D}")
+            }
+          } else if let u = item.claude {
+            Button("Open in Terminal") { openURL(u) }
+          }
           Button("Ask Claude Code") { store.askClaude(item) }
             .disabled(store.asking.contains(item.id))
         }

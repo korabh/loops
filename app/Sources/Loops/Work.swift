@@ -12,6 +12,7 @@ struct Item: Identifiable, Equatable {
   var at: Date { asks.map(\.at).max() ?? .distantPast }
   var loops: [String] { asks.map(\.loop).reduce(into: []) { if !$0.contains($1) { $0.append($1) } } }
   var claude: URL? { asks.compactMap(\.url).first { $0.scheme == "claude-cli" } }
+  var options: [(label: String, url: URL)] { asks.flatMap(\.options) }
 
   var headline: String {
     if let pr { return pr.tidyTitle }
